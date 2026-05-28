@@ -1,17 +1,6 @@
 #pragma once
 #include "fmha_fwd_d64_gemm.hpp"
 
-// ---- ds_bpermute: read another lane's VGPR ----
-
-__device__ inline float bpermute_f32(int src_lane, float val) {
-    int src_byte = src_lane * 4;
-    int ret;
-    asm volatile("ds_bpermute_b32 %0, %1, %2\n"
-                 "s_waitcnt lgkmcnt(0)"
-                 : "=v"(ret) : "v"(src_byte), "v"(val) : "memory");
-    return __builtin_bit_cast(float, ret);
-}
-
 // ---- Row max across 64 N-columns ----
 //
 // Each lane holds s_acc_n0[i] and s_acc_n1[i] for the SAME M row i.

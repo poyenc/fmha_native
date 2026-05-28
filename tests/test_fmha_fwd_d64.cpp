@@ -15,12 +15,12 @@
 // Kernel declaration (defined in fmha_fwd_d64_kernel.cpp)
 __global__ void fmha_fwd_d64_bf16_msk0(FmhaFwdParams params);
 
-// ---------- Softmax smoke test ----------
-// Verifies that P = softmax(Q * K^T * scale) is computed correctly.
-// The kernel stores normalized P (as bf16) to O for verification.
-// scale includes log2(e) for exp2-based softmax.
+// ---------- Softmax smoke test (disabled) ----------
+// This test verified the intermediate softmax P output that was stored
+// to O in an earlier kernel version. The kernel now computes full FMHA
+// (O = softmax(Q*K^T) * V). Use the parameterized test below instead.
 
-TEST(FmhaFwdD64Smoke, Softmax) {
+TEST(FmhaFwdD64Smoke, DISABLED_Softmax) {
     constexpr int B = 1, H = 1, S_q = 128, S_k = 64, D = 64;
     constexpr float kLog2e = 1.4426950408889634f;
 
@@ -170,12 +170,77 @@ TEST(FmhaFwdD64Smoke, Softmax) {
     hipFree(d_O);
 }
 
-// ---------- Parameterized full test (stub) ----------
+// ---------- Parameterized full test ----------
 
 class FmhaFwdD64Test : public ::testing::TestWithParam<TestCase> {};
 
 TEST_P(FmhaFwdD64Test, MatchesGpuRef) {
-    GTEST_SKIP() << "Kernel not implemented yet";
+    const auto& tc = GetParam();
+
+    // First pass: only run configs with no mask, no varlen, and MHA (no GQA/MQA)
+    if (tc.mask != 0) GTEST_SKIP() << "Causal mask not implemented yet";
+    if (!tc.varlen_seqs.empty()) GTEST_SKIP() << "Varlen not implemented yet";
+    if (tc.kv_heads != 0 && tc.kv_heads != tc.h)
+        GTEST_SKIP() << "GQA/MQA not implemented yet";
+
+    FmhaParams p = make_params(tc);
+    FmhaBuffers bufs(p);
+    bufs.fill_random(42);
+    bufs.copy_to_device();
+
+    constexpr float kLog2e = 1.4426950408889634f;
+
+    // Build FmhaFwdParams for our kernel
+    FmhaFwdParams kparams{};
+    kparams.q = reinterpret_cast<const __hip_bfloat16*>(bufs.d_Q);
+    kparams.k = reinterpret_cast<const __hip_bfloat16*>(bufs.d_K);
+    kparams.v = reinterpret_cast<const __hip_bfloat16*>(bufs.d_V);
+    kparams.o = reinterpret_cast<__hip_bfloat16*>(bufs.d_O);
+    kparams.lse = nullptr;
+    kparams.seqlen_q = p.seq_len;
+    kparams.seqlen_k = p.kv_seq_len;
+    kparams.nhead_q = p.q_heads;
+    kparams.nhead_k = p.kv_heads;
+    kparams.scale = kLog2e / sqrtf(static_cast<float>(p.head_dim));
+
+    // Strides in elements: [B, H, S, D]
+    const int D = p.hdim_dispatch();
+    kparams.stride_q       = D;
+    kparams.nhead_stride_q = p.seq_len * D;
+    kparams.batch_stride_q = p.q_heads * p.seq_len * D;
+
+    kparams.stride_k       = D;
+    kparams.nhead_stride_k = p.kv_seq_len * D;
+    kparams.batch_stride_k = p.kv_heads * p.kv_seq_len * D;
+
+    kparams.stride_v       = D;
+    kparams.nhead_stride_v = p.kv_seq_len * D;
+    kparams.batch_stride_v = p.kv_heads * p.kv_seq_len * D;
+
+    kparams.stride_o       = D;
+    kparams.nhead_stride_o = p.seq_len * D;
+    kparams.batch_stride_o = p.q_heads * p.seq_len * D;
+
+    kparams.seqstart_q = nullptr;
+    kparams.seqstart_k = nullptr;
+
+    // Launch kernel
+    const int m_tiles = (p.seq_len + kM0 - 1) / kM0;
+    dim3 grid(p.q_heads, m_tiles, p.batch);
+    dim3 block(kBlockSize);
+    hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk0, grid, block, 0, nullptr, kparams);
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+    // Copy output back
+    bufs.copy_from_device();
+
+    // Verify against CPU reference
+    CpuRefResult result = cpu_ref_verify(p, bufs);
+    EXPECT_TRUE(result.pass)
+        << "max_abs=" << result.max_abs
+        << " mismatches=" << result.mismatch << "/" << result.total_elems
+        << " nonfinite=" << result.nonfinite
+        << " cos_fail=" << result.cos_fail << "/" << result.cos_rows;
 }
 
 INSTANTIATE_TEST_SUITE_P(Full, FmhaFwdD64Test,

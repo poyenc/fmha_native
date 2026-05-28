@@ -4,6 +4,7 @@
 #include "fmha_fwd_d64_lds.hpp"
 #include "fmha_fwd_d64_gemm.hpp"
 #include "fmha_fwd_d64_softmax.hpp"
+#include "fmha_fwd_d64_epilog.hpp"
 
 // Build an __amdgpu_buffer_rsrc_t from a pre-offset base pointer.
 __device__ inline __amdgpu_buffer_rsrc_t make_buffer_resource(const void* base) {
@@ -11,17 +12,15 @@ __device__ inline __amdgpu_buffer_rsrc_t make_buffer_resource(const void* base) 
         const_cast<void*>(base), 0, 0xFFFFFFFF, 0x00027000);
 }
 
-// Convert fp32 to bf16 by truncation (device side).
-__device__ inline uint16_t fp32_to_bf16(float f) {
-    uint32_t u;
-    __builtin_memcpy(&u, &f, 4);
-    return static_cast<uint16_t>(u >> 16);
-}
-
 // FMHA forward D64 device function.
 //
-// Current implementation: GEMM0 only (S_acc = Q x K^T).
-// Processes a single K/V tile (seqlen_k <= 64).
+// Full FA v2 pipeline: multi-tile K/V loop with online softmax.
+// For each K/V tile:
+//   1. Copy K to LDS
+//   2. GEMM0: S = Q * K^T
+//   3. Online softmax update (rescale O_acc, compute P)
+//   4. GEMM1: O_acc += P * V (bpermute-based, correctness first)
+// Epilog: O = O_acc / row_sum, cast to bf16, store to DRAM.
 template <bool HasMask, bool IsVarlen>
 __device__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
                                     char* lds,
@@ -46,6 +45,9 @@ __device__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     const __hip_bfloat16* k_base =
         params.k + static_cast<int64_t>(batch_idx) * params.batch_stride_k
                   + static_cast<int64_t>(kv_head_idx) * params.nhead_stride_k;
+    const __hip_bfloat16* v_base =
+        params.v + static_cast<int64_t>(batch_idx) * params.batch_stride_v
+                  + static_cast<int64_t>(kv_head_idx) * params.nhead_stride_v;
     __hip_bfloat16* o_base =
         params.o + static_cast<int64_t>(batch_idx) * params.batch_stride_o
                   + static_cast<int64_t>(head_idx)  * params.nhead_stride_o;
@@ -69,65 +71,95 @@ __device__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
         }
     }
 
-    // ---- Copy K to LDS ----
-    // Load both k0 slices to LDS buffers 0 and 1.
+    // ---- Initialize online softmax state ----
+    float rmax[16], rsum[16];
+    for (int i = 0; i < 16; i++) {
+        rmax[i] = -INFINITY;
+        rsum[i] = 0.0f;
+    }
+    v16f o_acc_n0 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    v16f o_acc_n1 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+    // ---- LDS buffer offsets ----
     const int lds_buf0_bytes = 0;
     const int lds_buf1_bytes = kSingleSmemElements * 2; // 4608 bytes
 
-    copy_k_to_lds_2x(srd_k, params.stride_k, lds, lds_buf0_bytes, lds_buf1_bytes);
-    // Ensure all LDS writes are visible
-    s_waitcnt_lgkmcnt_0();
-    s_barrier();
+    const int num_kv_tiles = (params.seqlen_k + kN0 - 1) / kN0;
 
-    // ---- GEMM0: S_acc = Q x K^T ----
-    v16f s_acc_n0 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-    v16f s_acc_n1 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    // ---- Main K/V tile loop ----
+    for (int kv_tile = 0; kv_tile < num_kv_tiles; kv_tile++) {
+        int kv_offset = kv_tile * kN0;
 
-    gemm0(s_acc_n0, s_acc_n1, q_regs, lds, lds_buf0_bytes, lds_buf1_bytes, lane_id);
+        // ---- Copy K[kv_tile] to LDS (2 k0 slices) ----
+        copy_k_to_lds_2x_guarded(srd_k, params.stride_k, lds,
+                                  lds_buf0_bytes, lds_buf1_bytes,
+                                  kv_offset, params.seqlen_k);
+        s_waitcnt_lgkmcnt_0();
+        s_barrier();
 
-    // Apply scale
-    for (int i = 0; i < 16; i++) {
-        s_acc_n0[i] *= params.scale;
-        s_acc_n1[i] *= params.scale;
+        // ---- GEMM0: S_acc = Q x K^T ----
+        v16f s_acc_n0 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        v16f s_acc_n1 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+        gemm0(s_acc_n0, s_acc_n1, q_regs, lds, lds_buf0_bytes, lds_buf1_bytes, lane_id);
+
+        // ---- Scale ----
+        for (int i = 0; i < 16; i++) {
+            s_acc_n0[i] *= params.scale;
+            s_acc_n1[i] *= params.scale;
+        }
+
+        // ---- Mask out-of-bounds seqlen_k positions ----
+        {
+            int n_pos = lane_id & 31;
+            // s_acc_n0[i] is at seqlen_k position = n_pos
+            // s_acc_n1[i] is at seqlen_k position = 32 + n_pos
+            int seqk_n0 = kv_offset + n_pos;
+            int seqk_n1 = kv_offset + 32 + n_pos;
+            if (seqk_n0 >= params.seqlen_k) {
+                for (int i = 0; i < 16; i++) s_acc_n0[i] = -INFINITY;
+            }
+            if (seqk_n1 >= params.seqlen_k) {
+                for (int i = 0; i < 16; i++) s_acc_n1[i] = -INFINITY;
+            }
+        }
+
+        // ---- Online softmax update ----
+        float new_max[16];
+        softmax_row_max(new_max, s_acc_n0, s_acc_n1, lane_id);
+
+        // Rescale O_acc and old_sum when max changes
+        if (kv_tile > 0) {
+            rescale_o_acc(o_acc_n0, o_acc_n1, rmax, new_max);
+            for (int i = 0; i < 16; i++)
+                rsum[i] *= __builtin_amdgcn_exp2f(rmax[i] - new_max[i]);
+        }
+
+        // P = exp2(S - new_max)
+        softmax_exp(s_acc_n0, s_acc_n1, new_max);
+
+        // Accumulate row sums
+        float new_sum[16];
+        softmax_row_sum(new_sum, s_acc_n0, s_acc_n1, lane_id);
+        for (int i = 0; i < 16; i++)
+            rsum[i] += new_sum[i];
+
+        // Update max
+        for (int i = 0; i < 16; i++)
+            rmax[i] = new_max[i];
+
+        // ---- GEMM1: O_acc += P * V (bpermute-based) ----
+        // s_acc_n0/n1 now contain P (unnormalized exp values).
+        // V is loaded directly from DRAM per seqlen_k position.
+        gemm1_bpermute(o_acc_n0, o_acc_n1, s_acc_n0, s_acc_n1,
+                       v_base, params.stride_v, kv_offset, params.seqlen_k,
+                       lane_id);
+
+        // Barrier before next iteration's K copy overwrites LDS
+        s_barrier();
     }
 
-    // ---- Softmax: P = softmax(S_acc) via online algorithm with exp2 ----
-    //
-    // s_acc values are already in log2-scaled space (scale includes log2e).
-    // 1. Row max across 64 N-columns
-    // 2. exp2(S - max) for each element
-    // 3. Row sum of exp values
-    // 4. Normalize: P = exp / sum
-
-    float rmax[16];
-    softmax_row_max(rmax, s_acc_n0, s_acc_n1, lane_id);
-
-    softmax_exp(s_acc_n0, s_acc_n1, rmax);
-
-    float rsum[16];
-    softmax_row_sum(rsum, s_acc_n0, s_acc_n1, lane_id);
-
-    // Normalize by row sum
-    for (int i = 0; i < 16; i++) {
-        float inv_sum = 1.0f / rsum[i];
-        s_acc_n0[i] *= inv_sum;
-        s_acc_n1[i] *= inv_sum;
-    }
-
-    // ---- Store P to O (debug: bf16 for verification) ----
-    const int k_sub = lane_id >> 5;
-    const int n_pos = lane_id & 31;
-
-    for (int i = 0; i < 16; i++) {
-        int q_row_i = m_tile_idx * kM0 + warp_id * 32 + k_sub * 16 + i;
-        if (q_row_i >= params.seqlen_q) continue;
-
-        __hip_bfloat16* o_row = o_base + static_cast<int64_t>(q_row_i) * params.stride_o;
-
-        uint16_t bf16_n0 = fp32_to_bf16(s_acc_n0[i]);
-        uint16_t bf16_n1 = fp32_to_bf16(s_acc_n1[i]);
-
-        o_row[n_pos]      = *reinterpret_cast<const __hip_bfloat16*>(&bf16_n0);
-        o_row[32 + n_pos] = *reinterpret_cast<const __hip_bfloat16*>(&bf16_n1);
-    }
+    // ---- Epilog: normalize O by row_sum, cast to bf16, store ----
+    epilog_store_o(o_acc_n0, o_acc_n1, rsum, o_base, params.stride_o,
+                   params.seqlen_q, m_tile_idx, warp_id, lane_id);
 }

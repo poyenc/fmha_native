@@ -46,11 +46,13 @@ set_source_files_properties(
 # Test: GPU ref vs CPU ref
 add_executable(test_fmha_gpu_ref tests/test_fmha_gpu_ref.cpp)
 target_link_libraries(test_fmha_gpu_ref PRIVATE fmha_runner GTest::gtest_main)
+target_link_options(test_fmha_gpu_ref PRIVATE -fopenmp)
 set_source_files_properties(tests/test_fmha_gpu_ref.cpp PROPERTIES LANGUAGE HIP)
 
 # Test: kernel vs GPU ref
 add_executable(test_fmha_fwd_d64 tests/test_fmha_fwd_d64.cpp)
 target_link_libraries(test_fmha_fwd_d64 PRIVATE fmha_kernel fmha_runner GTest::gtest_main)
+target_link_options(test_fmha_fwd_d64 PRIVATE -fopenmp)
 set_source_files_properties(tests/test_fmha_fwd_d64.cpp PROPERTIES LANGUAGE HIP)
 
 # Benchmark

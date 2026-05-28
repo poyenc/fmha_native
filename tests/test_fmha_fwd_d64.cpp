@@ -173,6 +173,309 @@ TEST(FmhaFwdD64Smoke, DISABLED_Softmax) {
     hipFree(d_O);
 }
 
+// ---------- BSHD layout smoke test ----------
+// Verifies the kernel handles BSHD strides correctly by rearranging data
+// from BHSD to BSHD, running the kernel, then rearranging output back.
+// The CPU reference uses the original BHSD data.
+
+TEST(FmhaFwdD64Smoke, BSHD) {
+    constexpr int B = 2, Hq = 4, Hkv = 2, Sq = 256, Skv = 256, D = 64;
+    constexpr float kLog2e = 1.4426950408889634f;
+    const int gqa = Hq / Hkv;
+    const float scalar = 1.0f / sqrtf(static_cast<float>(D));
+
+    // 1. Generate random data in BHSD layout on host
+    const size_t nelems_q = (size_t)B * Hq  * Sq  * D;
+    const size_t nelems_k = (size_t)B * Hkv * Skv * D;
+    const size_t nelems_v = (size_t)B * Hkv * Skv * D;
+    const size_t nelems_o = (size_t)B * Hq  * Sq  * D;
+    std::vector<uint16_t> h_bhsd_Q(nelems_q), h_bhsd_K(nelems_k);
+    std::vector<uint16_t> h_bhsd_V(nelems_v);
+
+    srand(42);
+    for (auto& v : h_bhsd_Q) v = float_to_bf16(((rand() % 1000) - 500) / 5000.0f);
+    for (auto& v : h_bhsd_K) v = float_to_bf16(((rand() % 1000) - 500) / 5000.0f);
+    for (auto& v : h_bhsd_V) v = float_to_bf16(((rand() % 1000) - 500) / 5000.0f);
+
+    // 2. Rearrange BHSD -> BSHD on host
+    // BHSD index: b*H*S*D + h*S*D + s*D + d
+    // BSHD index: b*S*H*D + s*H*D + h*D + d
+    auto bhsd_to_bshd = [&](const std::vector<uint16_t>& src,
+                            int b_dim, int h_dim, int s_dim, int d_dim) {
+        std::vector<uint16_t> dst(src.size());
+        for (int b = 0; b < b_dim; b++)
+            for (int h = 0; h < h_dim; h++)
+                for (int s = 0; s < s_dim; s++)
+                    for (int d = 0; d < d_dim; d++) {
+                        size_t src_idx = ((size_t)b*h_dim + h)*s_dim*d_dim + s*d_dim + d;
+                        size_t dst_idx = ((size_t)b*s_dim + s)*h_dim*d_dim + h*d_dim + d;
+                        dst[dst_idx] = src[src_idx];
+                    }
+        return dst;
+    };
+
+    auto h_bshd_Q = bhsd_to_bshd(h_bhsd_Q, B, Hq,  Sq,  D);
+    auto h_bshd_K = bhsd_to_bshd(h_bhsd_K, B, Hkv, Skv, D);
+    auto h_bshd_V = bhsd_to_bshd(h_bhsd_V, B, Hkv, Skv, D);
+
+    // 3. Copy BSHD data to device
+    void *d_Q = nullptr, *d_K = nullptr, *d_V = nullptr, *d_O = nullptr;
+    ASSERT_EQ(hipMalloc(&d_Q, nelems_q * 2), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_K, nelems_k * 2), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_V, nelems_v * 2), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_O, nelems_o * 2), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_Q, h_bshd_Q.data(), nelems_q * 2, hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_K, h_bshd_K.data(), nelems_k * 2, hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_V, h_bshd_V.data(), nelems_v * 2, hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemset(d_O, 0, nelems_o * 2), hipSuccess);
+
+    // 4. Build kernel params with BSHD strides
+    FmhaFwdParams kparams{};
+    kparams.q = reinterpret_cast<const __hip_bfloat16*>(d_Q);
+    kparams.k = reinterpret_cast<const __hip_bfloat16*>(d_K);
+    kparams.v = reinterpret_cast<const __hip_bfloat16*>(d_V);
+    kparams.o = reinterpret_cast<__hip_bfloat16*>(d_O);
+    kparams.lse = nullptr;
+    kparams.seqlen_q = Sq;
+    kparams.seqlen_k = Skv;
+    kparams.nhead_q = Hq;
+    kparams.nhead_k = Hkv;
+    kparams.scale = kLog2e / sqrtf(static_cast<float>(D));
+    // BSHD strides: [B, S, H, D]
+    kparams.stride_q       = Hq  * D;   // row stride: skip all heads
+    kparams.nhead_stride_q = D;          // heads are adjacent within a row
+    kparams.batch_stride_q = Sq  * Hq  * D;
+    kparams.stride_k       = Hkv * D;
+    kparams.nhead_stride_k = D;
+    kparams.batch_stride_k = Skv * Hkv * D;
+    kparams.stride_v       = Hkv * D;
+    kparams.nhead_stride_v = D;
+    kparams.batch_stride_v = Skv * Hkv * D;
+    kparams.stride_o       = Hq  * D;
+    kparams.nhead_stride_o = D;
+    kparams.batch_stride_o = Sq  * Hq  * D;
+    kparams.seqstart_q = nullptr;
+    kparams.seqstart_k = nullptr;
+
+    // 5. Launch kernel (no mask for simplicity)
+    const int m_tiles = (Sq + kM0 - 1) / kM0;
+    dim3 grid(Hq, m_tiles, B);
+    dim3 block(kBlockSize);
+    hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk0, grid, block, 0, nullptr, kparams);
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+    // 6. Copy O back and rearrange BSHD -> BHSD
+    std::vector<uint16_t> h_bshd_O(nelems_o);
+    ASSERT_EQ(hipMemcpy(h_bshd_O.data(), d_O, nelems_o * 2, hipMemcpyDeviceToHost), hipSuccess);
+
+    std::vector<uint16_t> h_bhsd_O(nelems_o);
+    for (int b = 0; b < B; b++)
+        for (int h = 0; h < Hq; h++)
+            for (int s = 0; s < Sq; s++)
+                for (int d = 0; d < D; d++) {
+                    size_t bshd_idx = ((size_t)b*Sq + s)*Hq*D + h*D + d;
+                    size_t bhsd_idx = ((size_t)b*Hq + h)*Sq*D + s*D + d;
+                    h_bhsd_O[bhsd_idx] = h_bshd_O[bshd_idx];
+                }
+
+    // 7. CPU reference on original BHSD data
+    int mismatches = 0, nonfinite = 0;
+    float max_abs = 0;
+    for (int b = 0; b < B; b++)
+    for (int hq = 0; hq < Hq; hq++)
+    for (int i = 0; i < Sq; i++) {
+        const int hkv = hq / gqa;
+        // QK GEMM
+        std::vector<float> S(Skv);
+        for (int j = 0; j < Skv; j++) {
+            float dot = 0;
+            for (int d = 0; d < D; d++) {
+                size_t q_idx = ((size_t)b*Hq  + hq )*Sq *D + i*D + d;
+                size_t k_idx = ((size_t)b*Hkv + hkv)*Skv*D + j*D + d;
+                dot += bf16_to_float(h_bhsd_Q[q_idx]) * bf16_to_float(h_bhsd_K[k_idx]);
+            }
+            S[j] = dot * scalar;
+        }
+        // Softmax
+        float m = S[0];
+        for (int j = 1; j < Skv; j++) if (S[j] > m) m = S[j];
+        float sum = 0;
+        std::vector<float> P(Skv);
+        for (int j = 0; j < Skv; j++) { P[j] = expf(S[j] - m); sum += P[j]; }
+        float inv = 1.0f / sum;
+        for (int j = 0; j < Skv; j++) P[j] = bf16_to_float(float_to_bf16(P[j] * inv));
+        // PV GEMM + compare
+        for (int d = 0; d < D; d++) {
+            float o_ref = 0;
+            for (int j = 0; j < Skv; j++) {
+                size_t v_idx = ((size_t)b*Hkv + hkv)*Skv*D + j*D + d;
+                o_ref += P[j] * bf16_to_float(h_bhsd_V[v_idx]);
+            }
+            size_t o_idx = ((size_t)b*Hq + hq)*Sq*D + i*D + d;
+            float o_kern = bf16_to_float(h_bhsd_O[o_idx]);
+            float abs_err = fabsf(o_ref - o_kern);
+            if (!std::isfinite(abs_err)) { nonfinite++; continue; }
+            if (abs_err > max_abs) max_abs = abs_err;
+            if (abs_err > 0.001f) mismatches++;
+        }
+    }
+
+    fprintf(stderr, "BSHD test: max_abs=%.6f mismatches=%d nonfinite=%d\n",
+            max_abs, mismatches, nonfinite);
+    EXPECT_EQ(mismatches, 0) << "BSHD mismatches: " << mismatches;
+    EXPECT_EQ(nonfinite, 0) << "BSHD nonfinite: " << nonfinite;
+
+    hipFree(d_Q); hipFree(d_K); hipFree(d_V); hipFree(d_O);
+}
+
+// ---------- BSHD layout + causal mask smoke test ----------
+
+TEST(FmhaFwdD64Smoke, BSHDCausalGqa) {
+    constexpr int B = 1, Hq = 8, Hkv = 2, Sq = 300, Skv = 300, D = 64;
+    constexpr float kLog2e = 1.4426950408889634f;
+    const int gqa = Hq / Hkv;
+    const float scalar = 1.0f / sqrtf(static_cast<float>(D));
+
+    const size_t nelems_q = (size_t)B * Hq  * Sq  * D;
+    const size_t nelems_k = (size_t)B * Hkv * Skv * D;
+    const size_t nelems_v = (size_t)B * Hkv * Skv * D;
+    const size_t nelems_o = (size_t)B * Hq  * Sq  * D;
+    std::vector<uint16_t> h_bhsd_Q(nelems_q), h_bhsd_K(nelems_k);
+    std::vector<uint16_t> h_bhsd_V(nelems_v);
+
+    srand(123);
+    for (auto& v : h_bhsd_Q) v = float_to_bf16(((rand() % 1000) - 500) / 5000.0f);
+    for (auto& v : h_bhsd_K) v = float_to_bf16(((rand() % 1000) - 500) / 5000.0f);
+    for (auto& v : h_bhsd_V) v = float_to_bf16(((rand() % 1000) - 500) / 5000.0f);
+
+    auto bhsd_to_bshd = [&](const std::vector<uint16_t>& src,
+                            int b_dim, int h_dim, int s_dim, int d_dim) {
+        std::vector<uint16_t> dst(src.size());
+        for (int b = 0; b < b_dim; b++)
+            for (int h = 0; h < h_dim; h++)
+                for (int s = 0; s < s_dim; s++)
+                    for (int d = 0; d < d_dim; d++) {
+                        size_t src_idx = ((size_t)b*h_dim + h)*s_dim*d_dim + s*d_dim + d;
+                        size_t dst_idx = ((size_t)b*s_dim + s)*h_dim*d_dim + h*d_dim + d;
+                        dst[dst_idx] = src[src_idx];
+                    }
+        return dst;
+    };
+
+    auto h_bshd_Q = bhsd_to_bshd(h_bhsd_Q, B, Hq,  Sq,  D);
+    auto h_bshd_K = bhsd_to_bshd(h_bhsd_K, B, Hkv, Skv, D);
+    auto h_bshd_V = bhsd_to_bshd(h_bhsd_V, B, Hkv, Skv, D);
+
+    void *d_Q = nullptr, *d_K = nullptr, *d_V = nullptr, *d_O = nullptr;
+    ASSERT_EQ(hipMalloc(&d_Q, nelems_q * 2), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_K, nelems_k * 2), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_V, nelems_v * 2), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_O, nelems_o * 2), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_Q, h_bshd_Q.data(), nelems_q * 2, hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_K, h_bshd_K.data(), nelems_k * 2, hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_V, h_bshd_V.data(), nelems_v * 2, hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemset(d_O, 0, nelems_o * 2), hipSuccess);
+
+    FmhaFwdParams kparams{};
+    kparams.q = reinterpret_cast<const __hip_bfloat16*>(d_Q);
+    kparams.k = reinterpret_cast<const __hip_bfloat16*>(d_K);
+    kparams.v = reinterpret_cast<const __hip_bfloat16*>(d_V);
+    kparams.o = reinterpret_cast<__hip_bfloat16*>(d_O);
+    kparams.lse = nullptr;
+    kparams.seqlen_q = Sq;
+    kparams.seqlen_k = Skv;
+    kparams.nhead_q = Hq;
+    kparams.nhead_k = Hkv;
+    kparams.scale = kLog2e / sqrtf(static_cast<float>(D));
+    kparams.stride_q       = Hq  * D;
+    kparams.nhead_stride_q = D;
+    kparams.batch_stride_q = Sq  * Hq  * D;
+    kparams.stride_k       = Hkv * D;
+    kparams.nhead_stride_k = D;
+    kparams.batch_stride_k = Skv * Hkv * D;
+    kparams.stride_v       = Hkv * D;
+    kparams.nhead_stride_v = D;
+    kparams.batch_stride_v = Skv * Hkv * D;
+    kparams.stride_o       = Hq  * D;
+    kparams.nhead_stride_o = D;
+    kparams.batch_stride_o = Sq  * Hq  * D;
+    kparams.seqstart_q = nullptr;
+    kparams.seqstart_k = nullptr;
+
+    const int m_tiles = (Sq + kM0 - 1) / kM0;
+    dim3 grid(Hq, m_tiles, B);
+    dim3 block(kBlockSize);
+    hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk1, grid, block, 0, nullptr, kparams);
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+    std::vector<uint16_t> h_bshd_O(nelems_o);
+    ASSERT_EQ(hipMemcpy(h_bshd_O.data(), d_O, nelems_o * 2, hipMemcpyDeviceToHost), hipSuccess);
+
+    std::vector<uint16_t> h_bhsd_O(nelems_o);
+    for (int b = 0; b < B; b++)
+        for (int h = 0; h < Hq; h++)
+            for (int s = 0; s < Sq; s++)
+                for (int d = 0; d < D; d++) {
+                    size_t bshd_idx = ((size_t)b*Sq + s)*Hq*D + h*D + d;
+                    size_t bhsd_idx = ((size_t)b*Hq + h)*Sq*D + s*D + d;
+                    h_bhsd_O[bhsd_idx] = h_bshd_O[bshd_idx];
+                }
+
+    int mismatches = 0, nonfinite = 0;
+    float max_abs = 0;
+    for (int b = 0; b < B; b++)
+    for (int hq = 0; hq < Hq; hq++)
+    for (int i = 0; i < Sq; i++) {
+        const int hkv = hq / gqa;
+        std::vector<float> S(Skv);
+        for (int j = 0; j < Skv; j++) {
+            float dot = 0;
+            for (int d = 0; d < D; d++) {
+                size_t q_idx = ((size_t)b*Hq  + hq )*Sq *D + i*D + d;
+                size_t k_idx = ((size_t)b*Hkv + hkv)*Skv*D + j*D + d;
+                dot += bf16_to_float(h_bhsd_Q[q_idx]) * bf16_to_float(h_bhsd_K[k_idx]);
+            }
+            S[j] = dot * scalar;
+            // Causal mask: j > i + (Skv - Sq) => masked
+            if (j > i + (Skv - Sq)) S[j] = -INFINITY;
+        }
+        float m = S[0];
+        for (int j = 1; j < Skv; j++) if (S[j] > m) m = S[j];
+        std::vector<float> P(Skv);
+        if (m == -INFINITY) {
+            for (int j = 0; j < Skv; j++) P[j] = 0.0f;
+        } else {
+            float sum = 0;
+            for (int j = 0; j < Skv; j++) {
+                P[j] = (std::isinf(S[j]) && S[j] < 0) ? 0.0f : expf(S[j] - m);
+                sum += P[j];
+            }
+            float inv = 1.0f / sum;
+            for (int j = 0; j < Skv; j++) P[j] = bf16_to_float(float_to_bf16(P[j] * inv));
+        }
+        for (int d = 0; d < D; d++) {
+            float o_ref = 0;
+            for (int j = 0; j < Skv; j++) {
+                size_t v_idx = ((size_t)b*Hkv + hkv)*Skv*D + j*D + d;
+                o_ref += P[j] * bf16_to_float(h_bhsd_V[v_idx]);
+            }
+            size_t o_idx = ((size_t)b*Hq + hq)*Sq*D + i*D + d;
+            float o_kern = bf16_to_float(h_bhsd_O[o_idx]);
+            float abs_err = fabsf(o_ref - o_kern);
+            if (!std::isfinite(abs_err)) { nonfinite++; continue; }
+            if (abs_err > max_abs) max_abs = abs_err;
+            if (abs_err > 0.001f) mismatches++;
+        }
+    }
+
+    fprintf(stderr, "BSHD+causal+GQA test: max_abs=%.6f mismatches=%d nonfinite=%d\n",
+            max_abs, mismatches, nonfinite);
+    EXPECT_EQ(mismatches, 0) << "BSHD+causal+GQA mismatches: " << mismatches;
+    EXPECT_EQ(nonfinite, 0) << "BSHD+causal+GQA nonfinite: " << nonfinite;
+
+    hipFree(d_Q); hipFree(d_K); hipFree(d_V); hipFree(d_O);
+}
+
 // ---------- Parameterized full test ----------
 
 class FmhaFwdD64Test : public ::testing::TestWithParam<TestCase> {};

@@ -90,6 +90,17 @@ __device__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     for (int kv_tile = 0; kv_tile < num_kv_tiles; kv_tile++) {
         int kv_offset = kv_tile * kN0;
 
+        // Tile-level causal skip: if every element in this K/V tile
+        // is above the causal diagonal for all Q rows in this workgroup,
+        // skip the entire tile.
+        if constexpr (HasMask) {
+            int last_q_row = m_tile_idx * kM0 + kM0 - 1;
+            if (last_q_row >= params.seqlen_q)
+                last_q_row = params.seqlen_q - 1;
+            int shift = params.seqlen_k - params.seqlen_q;
+            if (kv_offset > last_q_row + shift) continue;
+        }
+
         // ---- Copy K[kv_tile] to LDS (2 k0 slices) ----
         copy_k_to_lds_2x_guarded(srd_k, params.stride_k, lds,
                                   lds_buf0_bytes, lds_buf1_bytes,
@@ -121,6 +132,20 @@ __device__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             }
             if (seqk_n1 >= params.seqlen_k) {
                 for (int i = 0; i < 16; i++) s_acc_n1[i] = -INFINITY;
+            }
+        }
+
+        // ---- Causal mask: mask positions where k_col > q_row + shift ----
+        if constexpr (HasMask) {
+            int k_sub = lane_id >> 5;
+            int n_pos = lane_id & 31;
+            int n_n0  = kv_offset + n_pos;
+            int n_n1  = kv_offset + 32 + n_pos;
+            int shift = params.seqlen_k - params.seqlen_q;
+            for (int i = 0; i < 16; i++) {
+                int m_idx = m_tile_idx * kM0 + warp_id * 32 + k_sub * 16 + i;
+                if (n_n0 > m_idx + shift) s_acc_n0[i] = -INFINITY;
+                if (n_n1 > m_idx + shift) s_acc_n1[i] = -INFINITY;
             }
         }
 

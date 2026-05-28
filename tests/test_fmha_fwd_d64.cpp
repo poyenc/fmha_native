@@ -12,8 +12,9 @@
 #include <cmath>
 #include <vector>
 
-// Kernel declaration (defined in fmha_fwd_d64_kernel.cpp)
+// Kernel declarations (defined in fmha_fwd_d64_kernel.cpp)
 __global__ void fmha_fwd_d64_bf16_msk0(FmhaFwdParams params);
+__global__ void fmha_fwd_d64_bf16_msk1(FmhaFwdParams params);
 
 // ---------- Softmax smoke test (disabled) ----------
 // This test verified the intermediate softmax P output that was stored
@@ -177,8 +178,7 @@ class FmhaFwdD64Test : public ::testing::TestWithParam<TestCase> {};
 TEST_P(FmhaFwdD64Test, MatchesGpuRef) {
     const auto& tc = GetParam();
 
-    // First pass: only run configs with no mask and no varlen
-    if (tc.mask != 0) GTEST_SKIP() << "Causal mask not implemented yet";
+    // First pass: only run configs with no varlen
     if (!tc.varlen_seqs.empty()) GTEST_SKIP() << "Varlen not implemented yet";
 
     FmhaParams p = make_params(tc);
@@ -233,7 +233,11 @@ TEST_P(FmhaFwdD64Test, MatchesGpuRef) {
     const int m_tiles = (p.seq_len + kM0 - 1) / kM0;
     dim3 grid(p.q_heads, m_tiles, p.batch);
     dim3 block(kBlockSize);
-    hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk0, grid, block, 0, nullptr, kparams);
+    if (tc.mask) {
+        hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk1, grid, block, 0, nullptr, kparams);
+    } else {
+        hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk0, grid, block, 0, nullptr, kparams);
+    }
     ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 
     // Copy output back

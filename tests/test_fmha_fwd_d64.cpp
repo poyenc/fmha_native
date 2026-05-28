@@ -15,12 +15,14 @@
 // Kernel declaration (defined in fmha_fwd_d64_kernel.cpp)
 __global__ void fmha_fwd_d64_bf16_msk0(FmhaFwdParams params);
 
-// ---------- GEMM0 smoke test ----------
-// Verifies that S_acc = Q * K^T * scale is computed correctly.
-// The kernel currently stores S_acc (as bf16) to O for verification.
+// ---------- Softmax smoke test ----------
+// Verifies that P = softmax(Q * K^T * scale) is computed correctly.
+// The kernel stores normalized P (as bf16) to O for verification.
+// scale includes log2(e) for exp2-based softmax.
 
-TEST(FmhaFwdD64Smoke, Gemm0) {
+TEST(FmhaFwdD64Smoke, Softmax) {
     constexpr int B = 1, H = 1, S_q = 128, S_k = 64, D = 64;
+    constexpr float kLog2e = 1.4426950408889634f;
 
     // Allocate device buffers
     const size_t nelems_q = static_cast<size_t>(B) * H * S_q * D;
@@ -59,7 +61,8 @@ TEST(FmhaFwdD64Smoke, Gemm0) {
     params.seqlen_k = S_k;
     params.nhead_q = H;
     params.nhead_k = H;
-    params.scale = 1.0f / sqrtf(static_cast<float>(D));
+    // scale includes log2(e) for exp2-based softmax
+    params.scale = kLog2e / sqrtf(static_cast<float>(D));
     // Q strides: [B, H, S_q, D]
     params.stride_q       = D;
     params.nhead_stride_q = S_q * D;
@@ -68,7 +71,7 @@ TEST(FmhaFwdD64Smoke, Gemm0) {
     params.stride_k       = D;
     params.nhead_stride_k = S_k * D;
     params.batch_stride_k = H * S_k * D;
-    // O strides: [B, H, S_q, S_k] (storing S matrix, not attention output)
+    // O strides: [B, H, S_q, S_k] (storing P matrix for verification)
     params.stride_o       = S_k;
     params.nhead_stride_o = S_q * S_k;
     params.batch_stride_o = H * S_q * S_k;
@@ -82,12 +85,13 @@ TEST(FmhaFwdD64Smoke, Gemm0) {
     hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk0, grid, block, 0, nullptr, params);
     ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 
-    // Read back O (which contains S_acc as bf16)
+    // Read back O (which contains softmax P as bf16)
     std::vector<uint16_t> h_O(nelems_o);
     ASSERT_EQ(hipMemcpy(h_O.data(), d_O, nbytes_o, hipMemcpyDeviceToHost), hipSuccess);
 
-    // CPU reference: S = Q * K^T * scale
-    // Q: [S_q, D], K: [S_k, D], S: [S_q, S_k]
+    // CPU reference: P = softmax(Q * K^T / sqrt(d))
+    // 1. Compute S = Q * K^T / sqrt(d) using bf16 inputs, fp32 accumulation
+    const float nat_scale = 1.0f / sqrtf(static_cast<float>(D));
     std::vector<float> ref_S(static_cast<size_t>(S_q) * S_k, 0.0f);
     for (int i = 0; i < S_q; i++) {
         for (int j = 0; j < S_k; j++) {
@@ -97,25 +101,46 @@ TEST(FmhaFwdD64Smoke, Gemm0) {
                 float k_val = bf16_to_float(h_K[j * D + d]);
                 dot += q_val * k_val;
             }
-            ref_S[i * S_k + j] = dot * params.scale;
+            ref_S[i * S_k + j] = dot * nat_scale;
         }
     }
 
-    // Compare: convert ref to bf16 for comparison
+    // 2. Softmax per row
+    std::vector<float> ref_P(static_cast<size_t>(S_q) * S_k);
+    for (int i = 0; i < S_q; i++) {
+        float row_max = -INFINITY;
+        for (int j = 0; j < S_k; j++)
+            row_max = fmaxf(row_max, ref_S[i * S_k + j]);
+
+        float row_sum = 0;
+        for (int j = 0; j < S_k; j++) {
+            ref_P[i * S_k + j] = expf(ref_S[i * S_k + j] - row_max);
+            row_sum += ref_P[i * S_k + j];
+        }
+
+        float inv_sum = 1.0f / row_sum;
+        for (int j = 0; j < S_k; j++)
+            ref_P[i * S_k + j] *= inv_sum;
+    }
+
+    // Compare kernel output against CPU reference (both as bf16)
     int mismatches = 0;
     float max_abs_err = 0;
+    float max_rel_err = 0;
     for (int i = 0; i < S_q; i++) {
         for (int j = 0; j < S_k; j++) {
-            float ref_val = ref_S[i * S_k + j];
+            float ref_val = ref_P[i * S_k + j];
             float kern_val = bf16_to_float(h_O[i * S_k + j]);
             float ref_bf16_val = bf16_to_float(float_to_bf16(ref_val));
             float abs_err = fabsf(kern_val - ref_bf16_val);
+            float rel_err = (ref_bf16_val != 0) ? abs_err / fabsf(ref_bf16_val) : abs_err;
             if (abs_err > max_abs_err) max_abs_err = abs_err;
-            // Allow tolerance for accumulated bf16 rounding
-            if (abs_err > 0.01f) {
+            if (rel_err > max_rel_err) max_rel_err = rel_err;
+            // Softmax values are in [0,1]; allow larger tolerance for exp/sum
+            if (abs_err > 0.02f) {
                 if (mismatches < 10) {
                     fprintf(stderr,
-                        "  mismatch [%d,%d]: kernel=%+.5f ref=%+.5f ref_bf16=%+.5f err=%.5f\n",
+                        "  mismatch [%d,%d]: kernel=%+.6f ref=%+.6f ref_bf16=%+.6f err=%.6f\n",
                         i, j, kern_val, ref_val, ref_bf16_val, abs_err);
                 }
                 mismatches++;
@@ -123,10 +148,22 @@ TEST(FmhaFwdD64Smoke, Gemm0) {
         }
     }
 
-    fprintf(stderr, "GEMM0 max abs err: %.6f, mismatches (>0.01): %d / %d\n",
-            max_abs_err, mismatches, S_q * S_k);
+    fprintf(stderr, "Softmax max abs err: %.6f, max rel err: %.6f, mismatches (>0.02): %d / %d\n",
+            max_abs_err, max_rel_err, mismatches, S_q * S_k);
+
+    // Verify row sums are close to 1.0
+    float max_rowsum_err = 0;
+    for (int i = 0; i < S_q; i++) {
+        float rowsum = 0;
+        for (int j = 0; j < S_k; j++)
+            rowsum += bf16_to_float(h_O[i * S_k + j]);
+        float err = fabsf(rowsum - 1.0f);
+        if (err > max_rowsum_err) max_rowsum_err = err;
+    }
+    fprintf(stderr, "Softmax max row-sum deviation from 1.0: %.6f\n", max_rowsum_err);
 
     EXPECT_EQ(mismatches, 0) << mismatches << " / " << (S_q * S_k) << " elements exceed tolerance";
+    EXPECT_LT(max_rowsum_err, 0.05f) << "Row sums deviate too much from 1.0";
 
     hipFree(d_Q);
     hipFree(d_K);

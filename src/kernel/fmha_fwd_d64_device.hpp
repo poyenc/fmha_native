@@ -3,6 +3,7 @@
 #include "runner/params.hpp"
 #include "fmha_fwd_d64_lds.hpp"
 #include "fmha_fwd_d64_gemm.hpp"
+#include "fmha_fwd_d64_softmax.hpp"
 
 // Build an __amdgpu_buffer_rsrc_t from a pre-offset base pointer.
 __device__ inline __amdgpu_buffer_rsrc_t make_buffer_resource(const void* base) {
@@ -90,13 +91,30 @@ __device__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
         s_acc_n1[i] *= params.scale;
     }
 
-    // ---- Store S_acc to O (debug: bf16 for verification) ----
+    // ---- Softmax: P = softmax(S_acc) via online algorithm with exp2 ----
     //
-    // MFMA output layout (TransposedC):
-    //   s_acc_nX[i] = S[q_row_i, n_col]
-    //   q_row_i = m_tile_idx*kM0 + warp_id*32 + k_sub*16 + i
-    //   n_col   = n_pos       (for s_acc_n0, 0..31)
-    //   n_col   = 32 + n_pos  (for s_acc_n1)
+    // s_acc values are already in log2-scaled space (scale includes log2e).
+    // 1. Row max across 64 N-columns
+    // 2. exp2(S - max) for each element
+    // 3. Row sum of exp values
+    // 4. Normalize: P = exp / sum
+
+    float rmax[16];
+    softmax_row_max(rmax, s_acc_n0, s_acc_n1, lane_id);
+
+    softmax_exp(s_acc_n0, s_acc_n1, rmax);
+
+    float rsum[16];
+    softmax_row_sum(rsum, s_acc_n0, s_acc_n1, lane_id);
+
+    // Normalize by row sum
+    for (int i = 0; i < 16; i++) {
+        float inv_sum = 1.0f / rsum[i];
+        s_acc_n0[i] *= inv_sum;
+        s_acc_n1[i] *= inv_sum;
+    }
+
+    // ---- Store P to O (debug: bf16 for verification) ----
     const int k_sub = lane_id >> 5;
     const int n_pos = lane_id & 31;
 

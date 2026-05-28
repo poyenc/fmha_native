@@ -177,11 +177,9 @@ class FmhaFwdD64Test : public ::testing::TestWithParam<TestCase> {};
 TEST_P(FmhaFwdD64Test, MatchesGpuRef) {
     const auto& tc = GetParam();
 
-    // First pass: only run configs with no mask, no varlen, and MHA (no GQA/MQA)
+    // First pass: only run configs with no mask and no varlen
     if (tc.mask != 0) GTEST_SKIP() << "Causal mask not implemented yet";
     if (!tc.varlen_seqs.empty()) GTEST_SKIP() << "Varlen not implemented yet";
-    if (tc.kv_heads != 0 && tc.kv_heads != tc.h)
-        GTEST_SKIP() << "GQA/MQA not implemented yet";
 
     FmhaParams p = make_params(tc);
     FmhaBuffers bufs(p);

@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(GPU_TARGET "gfx942" CACHE STRING "GPU target architecture")
 set(CMAKE_HIP_ARCHITECTURES ${GPU_TARGET})
 
+find_package(hip REQUIRED)
+
 # Google Test
 include(FetchContent)
 FetchContent_Declare(googletest
@@ -18,12 +20,18 @@ add_library(fmha_runner STATIC
     src/runner/cpu_ref.cpp
     src/runner/gpu_ref.cpp)
 target_include_directories(fmha_runner PUBLIC src)
-target_link_libraries(fmha_runner PUBLIC hip::device)
+target_include_directories(fmha_runner PUBLIC ${hip_INCLUDE_DIRS})
+target_link_libraries(fmha_runner PUBLIC hip::host)
 target_compile_options(fmha_runner PRIVATE -fopenmp)
 target_link_options(fmha_runner PRIVATE -fopenmp)
 set_source_files_properties(
     src/runner/gpu_ref.cpp
-    PROPERTIES LANGUAGE HIP)
+    PROPERTIES LANGUAGE HIP
+    COMPILE_FLAGS "--offload-arch=${GPU_TARGET}")
+set_source_files_properties(
+    src/runner/buffers.cpp
+    PROPERTIES LANGUAGE HIP
+    COMPILE_FLAGS "--offload-arch=${GPU_TARGET}")
 
 # Kernel library
 add_library(fmha_kernel STATIC src/kernel/fmha_fwd_d64_kernel.cpp)

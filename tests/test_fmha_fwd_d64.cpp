@@ -188,13 +188,20 @@ TEST_P(FmhaFwdD64Test, MatchesGpuRef) {
 
     constexpr float kLog2e = 1.4426950408889634f;
 
+    // Allocate separate LSE buffer for kernel when LSE is enabled
+    void* d_LSE_kern = nullptr;
+    if (tc.lse) {
+        ASSERT_EQ(hipMalloc(&d_LSE_kern, bufs.sz_LSE * sizeof(float)), hipSuccess);
+        ASSERT_EQ(hipMemset(d_LSE_kern, 0, bufs.sz_LSE * sizeof(float)), hipSuccess);
+    }
+
     // Build FmhaFwdParams for our kernel
     FmhaFwdParams kparams{};
     kparams.q = reinterpret_cast<const __hip_bfloat16*>(bufs.d_Q);
     kparams.k = reinterpret_cast<const __hip_bfloat16*>(bufs.d_K);
     kparams.v = reinterpret_cast<const __hip_bfloat16*>(bufs.d_V);
     kparams.o = reinterpret_cast<__hip_bfloat16*>(bufs.d_O);
-    kparams.lse = nullptr;
+    kparams.lse = tc.lse ? reinterpret_cast<float*>(d_LSE_kern) : nullptr;
     kparams.seqlen_q = p.seq_len;
     kparams.seqlen_k = p.kv_seq_len;
     kparams.nhead_q = p.q_heads;
@@ -239,6 +246,64 @@ TEST_P(FmhaFwdD64Test, MatchesGpuRef) {
         << " mismatches=" << result.mismatch << "/" << result.total_elems
         << " nonfinite=" << result.nonfinite
         << " cos_fail=" << result.cos_fail << "/" << result.cos_rows;
+
+    // Verify LSE against GPU reference
+    if (tc.lse) {
+        // Run GPU ref with LSE enabled (writes to bufs.d_LSE)
+        GpuRefParams gp{};
+        gp.d_Q = reinterpret_cast<const uint16_t*>(bufs.d_Q);
+        gp.d_K = reinterpret_cast<const uint16_t*>(bufs.d_K);
+        gp.d_V = reinterpret_cast<const uint16_t*>(bufs.d_V);
+        gp.d_O = reinterpret_cast<uint16_t*>(bufs.d_O);
+        gp.d_LSE = reinterpret_cast<float*>(bufs.d_LSE);
+        gp.batch = p.batch; gp.q_heads = p.q_heads; gp.kv_heads = p.kv_heads; gp.gqa = p.gqa;
+        gp.seq_len = p.seq_len; gp.kv_seq_len = p.kv_seq_len; gp.head_dim = p.head_dim;
+        gp.stride_q_seq = D; gp.stride_k_seq = D;
+        gp.stride_v_seq = D; gp.stride_o_seq = D;
+        gp.stride_q_head = bufs.stride_q_head / 2; gp.stride_q_batch = bufs.stride_q_batch / 2;
+        gp.stride_k_head = bufs.stride_k_head / 2; gp.stride_k_batch = bufs.stride_k_batch / 2;
+        gp.stride_v_head = bufs.stride_k_head / 2; gp.stride_v_batch = bufs.stride_k_batch / 2;
+        gp.stride_o_head = bufs.stride_q_head / 2; gp.stride_o_batch = bufs.stride_q_batch / 2;
+        gp.mask = p.mask; gp.scalar = p.scalar();
+        gp.d_seqstart_q = nullptr;
+        gp.d_seqstart_k = nullptr;
+
+        gpu_ref_fmha_fwd(gp);
+        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+        // Copy both LSE buffers to host
+        std::vector<float> h_lse_kern(bufs.sz_LSE);
+        std::vector<float> h_lse_ref(bufs.sz_LSE);
+        ASSERT_EQ(hipMemcpy(h_lse_kern.data(), d_LSE_kern,
+                            bufs.sz_LSE * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
+        ASSERT_EQ(hipMemcpy(h_lse_ref.data(), bufs.d_LSE,
+                            bufs.sz_LSE * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
+
+        int lse_mismatches = 0;
+        float lse_max_abs = 0;
+        for (size_t idx = 0; idx < bufs.sz_LSE; idx++) {
+            float kern_val = h_lse_kern[idx];
+            float ref_val  = h_lse_ref[idx];
+            if (std::isinf(kern_val) && std::isinf(ref_val) &&
+                kern_val < 0 && ref_val < 0)
+                continue;
+            float abs_err = fabsf(kern_val - ref_val);
+            if (abs_err > lse_max_abs) lse_max_abs = abs_err;
+            if (abs_err > 0.001f) {
+                if (lse_mismatches < 5) {
+                    fprintf(stderr, "  LSE mismatch [%zu]: kernel=%.6f ref=%.6f err=%.6f\n",
+                            idx, kern_val, ref_val, abs_err);
+                }
+                lse_mismatches++;
+            }
+        }
+        fprintf(stderr, "LSE max_abs=%.6f mismatches=%d/%zu\n",
+                lse_max_abs, lse_mismatches, bufs.sz_LSE);
+        EXPECT_EQ(lse_mismatches, 0)
+            << "LSE mismatches: " << lse_mismatches << "/" << bufs.sz_LSE;
+
+        hipFree(d_LSE_kern);
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(Full, FmhaFwdD64Test,

@@ -160,6 +160,14 @@ __device__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     }
 
     // ---- Epilog: normalize O by row_sum, cast to bf16, store ----
-    epilog_store_o(o_acc_n0, o_acc_n1, rsum, o_base, params.stride_o,
+    constexpr float kLog2e = 1.4426950408889634f;
+    float* lse_base = nullptr;
+    if (params.lse) {
+        lse_base = params.lse
+            + static_cast<int64_t>(batch_idx) * (params.nhead_q * params.seqlen_q)
+            + static_cast<int64_t>(head_idx) * params.seqlen_q;
+    }
+    epilog_store_o(o_acc_n0, o_acc_n1, rsum, rmax, o_base, params.stride_o,
+                   lse_base, kLog2e,
                    params.seqlen_q, m_tile_idx, warp_id, lane_id);
 }

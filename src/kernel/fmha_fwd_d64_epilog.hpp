@@ -12,8 +12,11 @@
 
 __device__ inline void epilog_store_o(v16f& o_acc_n0, v16f& o_acc_n1,
                                        const float (&rsum)[16],
+                                       const float (&rmax)[16],
                                        __hip_bfloat16* o_base,
                                        int stride_o,
+                                       float* lse_base,
+                                       float log2e,
                                        int seqlen_q,
                                        int m_tile_idx,
                                        int warp_id,
@@ -36,5 +39,13 @@ __device__ inline void epilog_store_o(v16f& o_acc_n0, v16f& o_acc_n1,
 
         o_row[n_pos]      = *reinterpret_cast<const __hip_bfloat16*>(&bf_n0);
         o_row[32 + n_pos] = *reinterpret_cast<const __hip_bfloat16*>(&bf_n1);
+
+        // Store LSE: lse = ln(rsum) + rmax / log2(e)
+        if (lse_base && n_pos == 0) {
+            float lse_val = (rsum[i] > 0.0f)
+                ? __logf(rsum[i]) + rmax[i] / log2e
+                : -INFINITY;
+            lse_base[m_row] = lse_val;
+        }
     }
 }

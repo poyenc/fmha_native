@@ -38,19 +38,44 @@ __device__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     const int nhead_ratio = params.nhead_q / params.nhead_k;
     const int kv_head_idx = head_idx / nhead_ratio;
 
+    // ---- Per-sequence lengths and offsets (varlen) ----
+    int seqlen_q, seqlen_k;
+    int offset_q = 0, offset_k = 0;
+    if constexpr (IsVarlen) {
+        offset_q = params.seqstart_q[batch_idx];
+        offset_k = params.seqstart_k[batch_idx];
+        seqlen_q = params.seqstart_q[batch_idx + 1] - offset_q;
+        seqlen_k = params.seqstart_k[batch_idx + 1] - offset_k;
+        if (m_tile_idx * kM0 >= seqlen_q) return;
+    } else {
+        seqlen_q = params.seqlen_q;
+        seqlen_k = params.seqlen_k;
+    }
+
     // ---- Base pointers ----
-    const __hip_bfloat16* q_base =
-        params.q + static_cast<int64_t>(batch_idx) * params.batch_stride_q
-                  + static_cast<int64_t>(head_idx)  * params.nhead_stride_q;
-    const __hip_bfloat16* k_base =
-        params.k + static_cast<int64_t>(batch_idx) * params.batch_stride_k
-                  + static_cast<int64_t>(kv_head_idx) * params.nhead_stride_k;
-    const __hip_bfloat16* v_base =
-        params.v + static_cast<int64_t>(batch_idx) * params.batch_stride_v
-                  + static_cast<int64_t>(kv_head_idx) * params.nhead_stride_v;
-    __hip_bfloat16* o_base =
-        params.o + static_cast<int64_t>(batch_idx) * params.batch_stride_o
-                  + static_cast<int64_t>(head_idx)  * params.nhead_stride_o;
+    const __hip_bfloat16* q_base;
+    const __hip_bfloat16* k_base;
+    const __hip_bfloat16* v_base;
+    __hip_bfloat16* o_base;
+    if constexpr (IsVarlen) {
+        q_base = params.q + static_cast<int64_t>(head_idx)    * params.nhead_stride_q
+                           + static_cast<int64_t>(offset_q)   * params.stride_q;
+        k_base = params.k + static_cast<int64_t>(kv_head_idx) * params.nhead_stride_k
+                           + static_cast<int64_t>(offset_k)   * params.stride_k;
+        v_base = params.v + static_cast<int64_t>(kv_head_idx) * params.nhead_stride_v
+                           + static_cast<int64_t>(offset_k)   * params.stride_v;
+        o_base = params.o + static_cast<int64_t>(head_idx)    * params.nhead_stride_o
+                           + static_cast<int64_t>(offset_q)   * params.stride_o;
+    } else {
+        q_base = params.q + static_cast<int64_t>(batch_idx) * params.batch_stride_q
+                           + static_cast<int64_t>(head_idx)  * params.nhead_stride_q;
+        k_base = params.k + static_cast<int64_t>(batch_idx) * params.batch_stride_k
+                           + static_cast<int64_t>(kv_head_idx) * params.nhead_stride_k;
+        v_base = params.v + static_cast<int64_t>(batch_idx) * params.batch_stride_v
+                           + static_cast<int64_t>(kv_head_idx) * params.nhead_stride_v;
+        o_base = params.o + static_cast<int64_t>(batch_idx) * params.batch_stride_o
+                           + static_cast<int64_t>(head_idx)  * params.nhead_stride_o;
+    }
 
     // ---- Build SRDs ----
     auto srd_q = make_buffer_resource(q_base);
@@ -60,7 +85,7 @@ __device__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     const int q_row_bytes = m_row * (params.stride_q * 2);
 
     v4i q_regs[8];
-    if (m_row < params.seqlen_q) {
+    if (m_row < seqlen_q) {
         for (int i = 0; i < 8; i++) {
             q_regs[i] = __builtin_amdgcn_raw_buffer_load_b128(
                 srd_q, q_row_bytes + i * 16, 0, 0);
@@ -84,7 +109,7 @@ __device__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     const int lds_buf0_bytes = 0;
     const int lds_buf1_bytes = kSingleSmemElements * 2; // 4608 bytes
 
-    const int num_kv_tiles = (params.seqlen_k + kN0 - 1) / kN0;
+    const int num_kv_tiles = (seqlen_k + kN0 - 1) / kN0;
 
     // ---- Main K/V tile loop ----
     for (int kv_tile = 0; kv_tile < num_kv_tiles; kv_tile++) {
@@ -95,16 +120,16 @@ __device__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
         // skip the entire tile.
         if constexpr (HasMask) {
             int last_q_row = m_tile_idx * kM0 + kM0 - 1;
-            if (last_q_row >= params.seqlen_q)
-                last_q_row = params.seqlen_q - 1;
-            int shift = params.seqlen_k - params.seqlen_q;
+            if (last_q_row >= seqlen_q)
+                last_q_row = seqlen_q - 1;
+            int shift = seqlen_k - seqlen_q;
             if (kv_offset > last_q_row + shift) continue;
         }
 
         // ---- Copy K[kv_tile] to LDS (2 k0 slices) ----
         copy_k_to_lds_2x_guarded(srd_k, params.stride_k, lds,
                                   lds_buf0_bytes, lds_buf1_bytes,
-                                  kv_offset, params.seqlen_k);
+                                  kv_offset, seqlen_k);
         s_waitcnt_lgkmcnt_0();
         s_barrier();
 
@@ -127,10 +152,10 @@ __device__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             // s_acc_n1[i] is at seqlen_k position = 32 + n_pos
             int seqk_n0 = kv_offset + n_pos;
             int seqk_n1 = kv_offset + 32 + n_pos;
-            if (seqk_n0 >= params.seqlen_k) {
+            if (seqk_n0 >= seqlen_k) {
                 for (int i = 0; i < 16; i++) s_acc_n0[i] = -INFINITY;
             }
-            if (seqk_n1 >= params.seqlen_k) {
+            if (seqk_n1 >= seqlen_k) {
                 for (int i = 0; i < 16; i++) s_acc_n1[i] = -INFINITY;
             }
         }
@@ -141,7 +166,7 @@ __device__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             int n_pos = lane_id & 31;
             int n_n0  = kv_offset + n_pos;
             int n_n1  = kv_offset + 32 + n_pos;
-            int shift = params.seqlen_k - params.seqlen_q;
+            int shift = seqlen_k - seqlen_q;
             for (int i = 0; i < 16; i++) {
                 int m_idx = m_tile_idx * kM0 + warp_id * 32 + k_sub * 16 + i;
                 if (n_n0 > m_idx + shift) s_acc_n0[i] = -INFINITY;
@@ -177,7 +202,7 @@ __device__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
         // s_acc_n0/n1 now contain P (unnormalized exp values).
         // V is loaded directly from DRAM per seqlen_k position.
         gemm1_bpermute(o_acc_n0, o_acc_n1, s_acc_n0, s_acc_n1,
-                       v_base, params.stride_v, kv_offset, params.seqlen_k,
+                       v_base, params.stride_v, kv_offset, seqlen_k,
                        lane_id);
 
         // Barrier before next iteration's K copy overwrites LDS
@@ -188,11 +213,19 @@ __device__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     constexpr float kLog2e = 1.4426950408889634f;
     float* lse_base = nullptr;
     if (params.lse) {
-        lse_base = params.lse
-            + static_cast<int64_t>(batch_idx) * (params.nhead_q * params.seqlen_q)
-            + static_cast<int64_t>(head_idx) * params.seqlen_q;
+        if constexpr (IsVarlen) {
+            // LSE layout: [H, total_tokens] — nhead_stride_q / stride_q = total_tokens
+            int nhead_stride_lse = params.nhead_stride_q / params.stride_q;
+            lse_base = params.lse
+                + static_cast<int64_t>(head_idx) * nhead_stride_lse
+                + offset_q;
+        } else {
+            lse_base = params.lse
+                + static_cast<int64_t>(batch_idx) * (params.nhead_q * params.seqlen_q)
+                + static_cast<int64_t>(head_idx) * params.seqlen_q;
+        }
     }
     epilog_store_o(o_acc_n0, o_acc_n1, rsum, rmax, o_base, params.stride_o,
                    lse_base, kLog2e,
-                   params.seqlen_q, m_tile_idx, warp_id, lane_id);
+                   seqlen_q, m_tile_idx, warp_id, lane_id);
 }

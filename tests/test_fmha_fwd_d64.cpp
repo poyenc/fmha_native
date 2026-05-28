@@ -15,6 +15,8 @@
 // Kernel declarations (defined in fmha_fwd_d64_kernel.cpp)
 __global__ void fmha_fwd_d64_bf16_msk0(FmhaFwdParams params);
 __global__ void fmha_fwd_d64_bf16_msk1(FmhaFwdParams params);
+__global__ void fmha_fwd_d64_bf16_msk0_varlen(FmhaFwdParams params);
+__global__ void fmha_fwd_d64_bf16_msk1_varlen(FmhaFwdParams params);
 
 // ---------- Softmax smoke test (disabled) ----------
 // This test verified the intermediate softmax P output that was stored
@@ -178,10 +180,8 @@ class FmhaFwdD64Test : public ::testing::TestWithParam<TestCase> {};
 TEST_P(FmhaFwdD64Test, MatchesGpuRef) {
     const auto& tc = GetParam();
 
-    // First pass: only run configs with no varlen
-    if (!tc.varlen_seqs.empty()) GTEST_SKIP() << "Varlen not implemented yet";
-
     FmhaParams p = make_params(tc);
+    const bool varlen = !tc.varlen_seqs.empty();
     FmhaBuffers bufs(p);
     bufs.fill_random(42);
     bufs.copy_to_device();
@@ -211,32 +211,50 @@ TEST_P(FmhaFwdD64Test, MatchesGpuRef) {
     // Strides in elements: [B, H, S, D]
     const int D = p.hdim_dispatch();
     kparams.stride_q       = D;
-    kparams.nhead_stride_q = p.seq_len * D;
-    kparams.batch_stride_q = p.q_heads * p.seq_len * D;
-
     kparams.stride_k       = D;
-    kparams.nhead_stride_k = p.kv_seq_len * D;
-    kparams.batch_stride_k = p.kv_heads * p.kv_seq_len * D;
-
     kparams.stride_v       = D;
-    kparams.nhead_stride_v = p.kv_seq_len * D;
-    kparams.batch_stride_v = p.kv_heads * p.kv_seq_len * D;
-
     kparams.stride_o       = D;
-    kparams.nhead_stride_o = p.seq_len * D;
-    kparams.batch_stride_o = p.q_heads * p.seq_len * D;
 
-    kparams.seqstart_q = nullptr;
-    kparams.seqstart_k = nullptr;
+    if (varlen) {
+        kparams.nhead_stride_q = bufs.total_seqlen * D;
+        kparams.nhead_stride_k = bufs.total_seqlen * D;
+        kparams.nhead_stride_v = bufs.total_seqlen * D;
+        kparams.nhead_stride_o = bufs.total_seqlen * D;
+        kparams.batch_stride_q = 0;
+        kparams.batch_stride_k = 0;
+        kparams.batch_stride_v = 0;
+        kparams.batch_stride_o = 0;
+        kparams.seqstart_q = reinterpret_cast<const int32_t*>(bufs.d_qseq);
+        kparams.seqstart_k = reinterpret_cast<const int32_t*>(bufs.d_kseq);
+    } else {
+        kparams.nhead_stride_q = p.seq_len * D;
+        kparams.nhead_stride_k = p.kv_seq_len * D;
+        kparams.nhead_stride_v = p.kv_seq_len * D;
+        kparams.nhead_stride_o = p.seq_len * D;
+        kparams.batch_stride_q = p.q_heads * p.seq_len * D;
+        kparams.batch_stride_k = p.kv_heads * p.kv_seq_len * D;
+        kparams.batch_stride_v = p.kv_heads * p.kv_seq_len * D;
+        kparams.batch_stride_o = p.q_heads * p.seq_len * D;
+        kparams.seqstart_q = nullptr;
+        kparams.seqstart_k = nullptr;
+    }
 
     // Launch kernel
     const int m_tiles = (p.seq_len + kM0 - 1) / kM0;
     dim3 grid(p.q_heads, m_tiles, p.batch);
     dim3 block(kBlockSize);
-    if (tc.mask) {
-        hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk1, grid, block, 0, nullptr, kparams);
+    if (varlen) {
+        if (tc.mask) {
+            hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk1_varlen, grid, block, 0, nullptr, kparams);
+        } else {
+            hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk0_varlen, grid, block, 0, nullptr, kparams);
+        }
     } else {
-        hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk0, grid, block, 0, nullptr, kparams);
+        if (tc.mask) {
+            hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk1, grid, block, 0, nullptr, kparams);
+        } else {
+            hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk0, grid, block, 0, nullptr, kparams);
+        }
     }
     ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 
@@ -269,8 +287,8 @@ TEST_P(FmhaFwdD64Test, MatchesGpuRef) {
         gp.stride_v_head = bufs.stride_k_head / 2; gp.stride_v_batch = bufs.stride_k_batch / 2;
         gp.stride_o_head = bufs.stride_q_head / 2; gp.stride_o_batch = bufs.stride_q_batch / 2;
         gp.mask = p.mask; gp.scalar = p.scalar();
-        gp.d_seqstart_q = nullptr;
-        gp.d_seqstart_k = nullptr;
+        gp.d_seqstart_q = varlen ? reinterpret_cast<const uint32_t*>(bufs.d_qseq) : nullptr;
+        gp.d_seqstart_k = varlen ? reinterpret_cast<const uint32_t*>(bufs.d_kseq) : nullptr;
 
         gpu_ref_fmha_fwd(gp);
         ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);

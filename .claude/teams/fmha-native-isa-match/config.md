@@ -278,10 +278,35 @@ coordination; files are for knowledge.
 
 ### When to rotate
 
-- Lead monitors teammate token usage (%) via tmux windows
+- Lead monitors teammate context usage (%) and idle/busy state via the
+  teammate's tmux pane (see Monitoring Teammates below)
 - Rotate at **60%** context usage — do NOT wait until degradation
 - Override: rotate immediately on quality degradation regardless of usage
 - Never rotate mid-task
+
+### Monitoring Teammates (tmux)
+
+Spawned teammates run as `claude` agent processes, each in its own tmux
+pane. The pane is NOT named after the teammate — find it by process, not
+by window name:
+
+```bash
+# 1. Map panes to PIDs and commands
+tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} #{pane_pid} #{pane_current_command}'
+
+# 2. Find the pane whose pid (or child) runs the target agent
+ps -ef | grep -- '--agent-name <name>'   # e.g. --agent-name research
+
+# 3. Read that pane's live output (status bar shows context% + cost + busy/idle)
+tmux capture-pane -t <session:window.pane> -p | tail -50
+```
+
+The teammate's status bar reports `[context: NN%]` and `[cost: $X]`, and
+the spinner line (`✻ Crunched for …` vs an empty `❯` prompt) shows
+busy vs idle. Use `context %` for the 60% rotation trigger and the
+spinner/prompt state to tell whether a teammate is mid-task before
+sending a check-in. This is the same mechanism for both idle detection
+and context-based rotation.
 
 ### Rotation point tracking
 
@@ -349,8 +374,23 @@ When lead's context is getting high:
 
 ## Context Management
 
-- Delegate reads above: 500 lines to Explore subagent
+**Default to subagents to protect your context.** Every teammate should
+offload context-heavy work to short-lived subagents (Explore for
+read-only, general-purpose for work that writes) and keep only the
+distilled result in its own context. The point is to avoid context rot —
+your own window stays small and focused while the subagent absorbs the
+bulk.
+
+- Files > 500 lines: ALWAYS via subagent (never read directly)
+- Files 100–500 lines: subagent or offset/limit
+- Files < 100 lines: direct read is fine
 - Assembly files (.s): ALWAYS via Explore subagent, never read directly
+- CK source headers (most are 500–4000 lines): ALWAYS via Explore
+  subagent with a precise extraction prompt — ask for the specific
+  formula/table/struct you need, not a full dump
+- When a subagent returns, save its distilled finding to your output
+  file; do not paste large excerpts back into your own context
+- Parallelize independent reads across multiple subagents in one batch
 
 ## Constraints
 

@@ -87,16 +87,27 @@ For each tensor in CK's pipeline, document:
 |--------|-----------|-------------|-------------|
 | Q_tile | `load_tile()` from DRAM | Q load distribution (k_sub-dependent?) | GEMM0 B operand |
 | K_lds | `async_load_tile_raw()` to LDS | LDS padded row layout | GEMM0 A operand via `ds_read_b128` |
-| S_acc | GEMM0 C-output | MFMA C: `[k_sub*16+i, lane%32]` | softmax |
-| P_tile | softmax(S_acc) | same as S_acc (element-wise) | `shuffle_tile()` → P_shuffled |
-| **P_shuffled** | **`shuffle_tile(P_tile)`** | **? — must discover** | GEMM1 B operand packing |
-| V_loaded | `load_tile()` from DRAM | DRAM load distribution | `shuffle_tile()` → V_shuffled |
-| **V_shuffled** | **`shuffle_tile(V_loaded)`** | **? — must discover** | LDS write (`ds_write2_b32`) |
-| V_lds | LDS (written by V_shuffled) | transposed padded layout | GEMM1 A operand via `ds_read_b128` |
-| O_acc | GEMM1 C-output | MFMA C: `[k_sub*16+i, lane%32]` | `shuffle_tile()` → O_shuffled |
-| **O_shuffled** | **`shuffle_tile(O_acc)`** | **? — must discover** | `buffer_store_dwordx2` |
+| S_acc | GEMM0 C-output | MFMA C: physical `n=lane%32, m=(r/4)*8+(lane/32)*4+(r%4)` (TransposedC) | softmax (in place) |
+| P_tile | softmax(S_acc), cast bf16 | **same as S_acc** (no relayout) | GEMM1 A operand directly |
+| V_loaded | `load_tile()` from DRAM | V DRAM dist (K3 outer, N1 inner) | `shuffle_tile()` → V_shuffled |
+| **V_shuffled** | **`shuffle_tile(V_loaded)`** — intra-thread `v_perm_b32` | **N1 outer, K3 inner** (per-thread 4×2→2×4 transpose, same lane) | LDS write (`store_tile`) |
+| V_lds | LDS (written from V_shuffled) | transposed padded layout (`MakeVLdsBlockDescriptor`) | GEMM1 B operand via `ds_read_b128` |
+| O_acc | GEMM1 C-output | MFMA C: same TransposedC as S_acc | Default2D epilogue (×1/rsum, cast bf16) |
+| O_final | Default2D epilogue | **same C-output dist** (no reshuffle) — normalized bf16 | `buffer_store_dwordx2` |
 
-The three bolded rows are the unknowns that caused all prior failures.
+> ✅ **RESOLVED (Phase 0.1–0.4, 2026-05-29):** CK's pipeline has exactly
+> ONE `shuffle_tile()` — on **V** (intra-thread `v_perm_b32`, per-thread
+> 4×2→2×4 register transpose, same lane; see `shuffle_trace.md` §2–3).
+> **There is NO P shuffle** — S/P/O share the identical 32×32 TransposedC
+> distribution, so P feeds GEMM1 A directly from S's C-output after
+> in-place softmax + bf16 cast (`shuffle_trace.md` §4). **There is also NO
+> O shuffle** — the epilogue is **Default2DEpilogue** (asm-confirmed from
+> the kernel symbol; 0.1's "CShuffle" was a wrong source-guess). O_acc is
+> normalized (×1/rsum), cast to bf16, and `buffer_store`d directly in the
+> C-output distribution. So NONE of the three original "unknowns" is a
+> cross-lane shuffle: V = intra-thread v_perm; P = direct feed; O = direct
+> store. The only remaining layout details to golden-verify are the K/V
+> LDS byte layouts and the exact register orders (Phases 0.6–0.11).
 
 ### Verification Method
 

@@ -55,6 +55,18 @@ target_link_libraries(test_fmha_fwd_d64 PRIVATE fmha_kernel fmha_runner GTest::g
 target_link_options(test_fmha_fwd_d64 PRIVATE -fopenmp)
 set_source_files_properties(tests/test_fmha_fwd_d64.cpp PROPERTIES LANGUAGE HIP)
 
+# Test: K LDS staging (Phase 1 Kernel 1)
+add_executable(test_k_lds tests/test_k_lds.cpp src/refs/ref_k_lds.cpp)
+target_link_libraries(test_k_lds PRIVATE fmha_runner GTest::gtest)
+set_source_files_properties(tests/test_k_lds.cpp PROPERTIES LANGUAGE HIP
+    COMPILE_FLAGS "-O3 --offload-arch=${GPU_TARGET} --save-temps")
+
+# Test: QK GEMM (Phase 1 Kernel 2)
+add_executable(test_qk_gemm tests/test_qk_gemm.cpp src/refs/ref_qk_gemm.cpp)
+target_link_libraries(test_qk_gemm PRIVATE fmha_runner GTest::gtest)
+set_source_files_properties(tests/test_qk_gemm.cpp PROPERTIES LANGUAGE HIP
+    COMPILE_FLAGS "-O3 --offload-arch=${GPU_TARGET} --save-temps")
+
 # Benchmark
 add_executable(bench_fmha_fwd src/bench_fmha_fwd.cpp)
 target_link_libraries(bench_fmha_fwd PRIVATE fmha_kernel fmha_runner)

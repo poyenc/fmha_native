@@ -130,6 +130,16 @@ movement (LDS write/read, bpermute, or perm)?
 
 - [ ] **Step 2:** Trace one shuffle end-to-end
 
+> ⚠️ **Flagged by Phase 0.1 (2026-05-29):** the pipeline trace
+> (`research/pipeline_trace.md`) found the ONLY `shuffle_tile()` in CK's
+> pipeline is on **V** (`v_buf → v_shuffle_tmp`). **P does NOT use
+> `shuffle_tile`** — it stays in registers and is only `cast_tile`'d
+> (fp32→bf16) before GEMM1. So "the P shuffle" below may not exist as a
+> cross-thread shuffle. **0.3 Step 2 should trace the V shuffle instead**
+> and confirm/deny whether any P data movement happens. If P is reg-only,
+> task 0.9 simplifies to a P cast/repack verification (no shuffle).
+> Do not assume a P shuffle exists — verify first.
+
 Pick the P shuffle (softmax output → GEMM1 B operand). Using the source
 and target distribution types from 0.2 Step 4, trace the shuffle:
 - Which elements move between threads?
@@ -263,28 +273,49 @@ verified Q pattern from 0.7), issue 16 MFMAs, dump S_acc to DRAM.
 
 - [ ] **Step 6** *(research)*: If confirmed → mark S_acc as **verified**
 
-### 0.9 — Verify & map P shuffle distribution (CRITICAL)
+### 0.9 — Verify P → GEMM1 A feed (NO shuffle — cast/repack only)
 
-- [ ] **Step 1** *(research)*: Read CK P shuffle, write hypothesis
+> ✅ **RESOLVED by Phase 0.3 (2026-05-29):** CK's P has **no
+> `shuffle_tile`**. Confirmed three ways — 0.1 (P never an arg to
+> shuffle_tile), 0.2 (S/P/O share the identical 32×32 TransposedC dist),
+> 0.3 (`shuffle_tile` is intra-thread `v_perm_b32` only and *cannot* do a
+> cross-lane S→A remap). CK uses TransposedC on GEMM0 precisely so S's
+> C-output is directly usable as GEMM1's A-operand. See
+> `research/shuffle_trace.md` §4. **This task is now: verify P feeds
+> GEMM1 A directly from the S_acc C-distribution after softmax + bf16
+> cast, with NO cross-thread movement.** There is no "P_shuffled" golden
+> tensor — the dump at that boundary should equal P in the S_acc layout
+> (cast to bf16). If a `v_perm_b32` repack is present, it is the
+> fp32→bf16 truncation pack (selector `0x07060302`), NOT a shuffle.
 
-Document in `/tmp/fmha-native-isa-match/research/hypothesis_p_shuffle.md`:
-- Source distribution (same as S_acc)
-- Target distribution (GEMM1 B-operand format)
-- Per-thread register mapping after shuffle
-- How 4 bf16 values pack into `short4`
+- [ ] **Step 1** *(research)*: Document the P feed in
+  `/tmp/fmha-native-isa-match/research/hypothesis_p_feed.md`:
+  - Source = target = S_acc 32×32 TransposedC distribution (same lanes,
+    same register ownership)
+  - Softmax operates in place; cast fp32→bf16
+  - Whether a `v_perm_b32` (selector `0x07060302`) bf16-pack is applied
+    before GEMM1 A consumes P, and the resulting packed register layout
 
-- [ ] **Step 2** *(impl)*: Write verification kernel `tools/verify/verify_p_shuffle.hip`
+- [ ] **Step 2** *(impl)*: Write verification kernel `tools/verify/verify_p_feed.hip`
 
-Load P in S_acc layout (verified from 0.8), apply hypothesized shuffle,
-dump P_shuffled registers to DRAM.
+Load P in the verified S_acc layout (from 0.8), apply the bf16 cast/pack
+(no shuffle), dump the GEMM1-A-operand registers to DRAM.
 
 - [ ] **Step 3** *(build)*: Build
 
-- [ ] **Step 4** *(test)*: Compare against golden P_shuffled — bit-exact
+- [ ] **Step 4** *(test)*: Compare against the golden P dump (P in S_acc
+  layout, bf16) — bit-exact. Assert NO cross-lane movement vs S_acc.
 
-- [ ] **Step 5** *(debug)*: If mismatch → investigate shuffle implementation
+- [ ] **Step 5** *(debug)*: If mismatch → investigate cast/pack (NOT a
+  shuffle — there is none)
 
-- [ ] **Step 6** *(research)*: If confirmed → mark P_shuffled as **verified**
+- [ ] **Step 6** *(research)*: If confirmed → mark P→A feed as **verified**
+
+> ⚠️ **Downstream impact (for impl, Phase 1 & 2):** do NOT build a
+> "P shuffle" stage. The kernel keeps S_acc in TransposedC, runs softmax
+> in place, casts to bf16, and feeds GEMM1 A directly. A spurious P
+> shuffle adds dead VGPRs and diverges from CK's ISA (CK asm has no
+> P-shuffle instructions), threatening the VGPR ≤127 / ISA-match goal.
 
 ### 0.10 — Verify & map V load + shuffle + LDS distribution (CRITICAL)
 
@@ -309,27 +340,39 @@ Load V from DRAM, apply repack + transposed write per hypothesis,
 
 - [ ] **Step 6** *(research)*: If confirmed → mark V LDS as **verified**
 
-### 0.11 — Verify & map O accumulator + O shuffle distribution (CRITICAL)
+### 0.11 — Verify & map O accumulator + Default2D epilogue store (CRITICAL)
 
-- [ ] **Step 1** *(research)*: Read CK cshuffle epilogue, write hypothesis
+> ✅ **CORRECTED by Phase 0.4 (2026-05-29):** the fwd d64 kernel uses
+> **Default2DEpilogue**, NOT CShuffle (asm-confirmed from the kernel
+> symbol; 0.1's CShuffle claim was a wrong source-guess). **There is no O
+> shuffle and no O_shuffled tensor.** O_acc is normalized (×1/rsum), cast
+> to bf16, and `buffer_store`d directly in the MFMA C-output
+> distribution. This task verifies O_acc (C layout, fp32) and O_final
+> (normalized bf16 in store layout) — NOT a shuffle.
 
-Document in `/tmp/fmha-native-isa-match/research/hypothesis_o_shuffle.md`:
-- O_acc distribution (same as S_acc, MFMA C-output)
-- cshuffle transformation: which lanes exchange, what register layout results
-- How post-shuffle layout enables buffer_store_dwordx2 of 4 consecutive hdim values
+- [ ] **Step 1** *(research)*: Read CK Default2D epilogue, write hypothesis
 
-- [ ] **Step 2** *(impl)*: Write verification kernel `tools/verify/verify_o_shuffle.hip`
+Document in `/tmp/fmha-native-isa-match/research/hypothesis_o_store.md`:
+- O_acc distribution (same as S_acc, MFMA C-output, 32 regs/lane)
+- Default2D transform: ×(1/rsum) normalization, fp32→bf16 cast (v_perm
+  pack selector?), and the buffer_store voffset/addressing per thread
+- How the C-output layout maps to the DRAM O[seqlen_q, hdim] store
+  (which lane/reg writes which (m, hdim) element)
 
-Load O_acc in MFMA C-output layout (verified from 0.8 pattern), apply
-hypothesized O shuffle, dump O_shuffled registers to DRAM.
+- [ ] **Step 2** *(impl)*: Write verification kernel `tools/verify/verify_o_store.hip`
+
+Load O_acc in MFMA C-output layout (from 0.8 pattern), apply the Default2D
+normalize + bf16 cast (NO shuffle), dump O_final registers to DRAM.
 
 - [ ] **Step 3** *(build)*: Build
 
-- [ ] **Step 4** *(test)*: Compare against golden O_shuffled — bit-exact
+- [ ] **Step 4** *(test)*: Compare against golden O_acc (fp32) and O_final
+  (bf16) — bit-exact. Assert NO cross-lane movement vs O_acc.
 
-- [ ] **Step 5** *(debug)*: If mismatch → investigate cshuffle implementation
+- [ ] **Step 5** *(debug)*: If mismatch → investigate normalize/cast/store
+  addressing (NOT a shuffle — there is none)
 
-- [ ] **Step 6** *(research)*: If confirmed → mark O_shuffled as **verified**
+- [ ] **Step 6** *(research)*: If confirmed → mark O store path as **verified**
 
 ### 0.12 — Write confirmed tensor layout map *(research)*
 

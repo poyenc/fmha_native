@@ -11,7 +11,8 @@
 #include "kernels/k_lds.hpp"
 
 // Optional golden directory (set via --golden=<dir>). Empty => skip golden check.
-static std::string g_golden_dir;
+static std::string g_golden_full;
+static std::string g_golden_partial;
 
 namespace {
 
@@ -81,24 +82,26 @@ void check_vs_cpu_ref(const std::vector<uint16_t>& kern,
         if (kern[e] != expected[e]) {
             ++mism;
             if (shown < 10) {
-                fprintf(stderr, "  cpu-ref mismatch e=%d kern=0x%04x exp=0x%04x\n",
+                fprintf(stderr, "  [cpuref] mismatch e=%d kern=0x%04x exp=0x%04x\n",
                         e, kern[e], expected[e]);
                 ++shown;
             }
         }
     }
-    EXPECT_EQ(mism, 0) << mism << " / " << kKLdsRegionElems
-                       << " bytes differ from CPU reference";
+    fprintf(stderr, "  [cpuref] mism=%d/%d\n", mism, kKLdsRegionElems);
+    EXPECT_EQ(mism, 0) << "cpuref: " << mism << " / " << kKLdsRegionElems
+                       << " elements differ";
 }
 
 // Byte-exact: kernel dump vs golden, over the K (j,d) data slots only.
 // Golden stores each bf16 widened to fp32 at index (kGoldenBufferBase + off).
-void check_vs_golden(const std::vector<uint16_t>& kern, int kv_offset, int seqlen_k) {
-    if (g_golden_dir.empty()) {
-        GTEST_SKIP() << "no --golden dir provided";
+void check_vs_golden(const std::vector<uint16_t>& kern, int kv_offset, int seqlen_k,
+                     const std::string& golden_dir) {
+    if (golden_dir.empty()) {
+        GTEST_SKIP() << "no golden dir provided";
     }
     std::vector<float> golden;
-    ASSERT_TRUE(load_golden_klds(g_golden_dir, golden));
+    ASSERT_TRUE(load_golden_klds(golden_dir, golden));
 
     int mism = 0, shown = 0, checked = 0;
     for (int j = 0; j < 64; ++j) {
@@ -120,9 +123,8 @@ void check_vs_golden(const std::vector<uint16_t>& kern, int kv_offset, int seqle
             }
         }
     }
-    fprintf(stderr, "  golden compare: %d/%d data slots matched\n",
-            checked - mism, checked);
-    EXPECT_EQ(mism, 0) << mism << " / " << checked << " data slots differ from golden";
+    fprintf(stderr, "  [golden] mism=%d/%d\n", mism, checked);
+    EXPECT_EQ(mism, 0) << "golden: " << mism << " / " << checked << " elements differ";
 }
 
 } // namespace
@@ -138,7 +140,7 @@ TEST(KLdsFullTile, MatchesGolden) {
     const int seqlen_k = 64, D = 64, stride_k = 64, kv_offset = 0;
     auto h_K = make_golden_K(seqlen_k, D);
     auto kern = run_kernel(h_K, stride_k, kv_offset, seqlen_k);
-    check_vs_golden(kern, kv_offset, seqlen_k);
+    check_vs_golden(kern, kv_offset, seqlen_k, g_golden_full);
 }
 
 TEST(KLdsPartialTile, MatchesCpuRef) {
@@ -152,19 +154,44 @@ TEST(KLdsPartialTile, MatchesGolden) {
     const int seqlen_k = 33, D = 64, stride_k = 64, kv_offset = 0;
     auto h_K = make_golden_K(seqlen_k, D);
     auto kern = run_kernel(h_K, stride_k, kv_offset, seqlen_k);
-    check_vs_golden(kern, kv_offset, seqlen_k);
+    check_vs_golden(kern, kv_offset, seqlen_k, g_golden_partial);
+}
+
+// ---- Edge case tests (CPU ref only) ----
+
+TEST(KLdsEdge, MinTile) {
+    const int seqlen_k = 1, D = 64, stride_k = 64, kv_offset = 0;
+    auto h_K = make_golden_K(seqlen_k, D);
+    auto kern = run_kernel(h_K, stride_k, kv_offset, seqlen_k);
+    check_vs_cpu_ref(kern, h_K, stride_k, kv_offset, seqlen_k);
+}
+
+TEST(KLdsEdge, FullM0) {
+    const int seqlen_k = 64, D = 64, stride_k = 64, kv_offset = 0;
+    auto h_K = make_golden_K(seqlen_k, D);
+    auto kern = run_kernel(h_K, stride_k, kv_offset, seqlen_k);
+    check_vs_cpu_ref(kern, h_K, stride_k, kv_offset, seqlen_k);
+}
+
+TEST(KLdsEdge, SingleCol) {
+    const int seqlen_k = 1, D = 64, stride_k = 64, kv_offset = 0;
+    auto h_K = make_golden_K(seqlen_k, D);
+    auto kern = run_kernel(h_K, stride_k, kv_offset, seqlen_k);
+    check_vs_cpu_ref(kern, h_K, stride_k, kv_offset, seqlen_k);
 }
 
 int main(int argc, char** argv) {
-    // Parse --golden=<dir>, strip it before handing argv to gtest.
     std::vector<char*> rest;
     rest.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
-        if (std::strncmp(argv[i], "--golden=", 9) == 0) {
-            g_golden_dir = argv[i] + 9;
-        } else {
+        if (std::strncmp(argv[i], "--golden-full=", 14) == 0)
+            g_golden_full = argv[i] + 14;
+        else if (std::strncmp(argv[i], "--golden-partial=", 17) == 0)
+            g_golden_partial = argv[i] + 17;
+        else if (std::strncmp(argv[i], "--golden=", 9) == 0)
+            { g_golden_full = argv[i] + 9; g_golden_partial = argv[i] + 9; }
+        else
             rest.push_back(argv[i]);
-        }
     }
     int rc = static_cast<int>(rest.size());
     ::testing::InitGoogleTest(&rc, rest.data());

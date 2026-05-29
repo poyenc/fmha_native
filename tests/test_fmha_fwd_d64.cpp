@@ -36,9 +36,9 @@ TEST(FmhaFwdD64Smoke, DISABLED_Softmax) {
     const size_t nbytes_o = nelems_o * sizeof(__hip_bfloat16);
 
     void *d_Q = nullptr, *d_K = nullptr, *d_O = nullptr;
-    ASSERT_EQ(hipMalloc(&d_Q, nbytes_q), hipSuccess);
-    ASSERT_EQ(hipMalloc(&d_K, nbytes_k), hipSuccess);
-    ASSERT_EQ(hipMalloc(&d_O, nbytes_o), hipSuccess);
+    EXPECT_EQ(hipMalloc(&d_Q, nbytes_q), hipSuccess);
+    EXPECT_EQ(hipMalloc(&d_K, nbytes_k), hipSuccess);
+    EXPECT_EQ(hipMalloc(&d_O, nbytes_o), hipSuccess);
 
     // Fill Q and K with known data on host
     std::vector<uint16_t> h_Q(nelems_q);
@@ -49,9 +49,9 @@ TEST(FmhaFwdD64Smoke, DISABLED_Softmax) {
     for (size_t i = 0; i < nelems_k; i++)
         h_K[i] = float_to_bf16(((int)(i % 997) - 498) / 5000.0f);
 
-    ASSERT_EQ(hipMemcpy(d_Q, h_Q.data(), nbytes_q, hipMemcpyHostToDevice), hipSuccess);
-    ASSERT_EQ(hipMemcpy(d_K, h_K.data(), nbytes_k, hipMemcpyHostToDevice), hipSuccess);
-    ASSERT_EQ(hipMemset(d_O, 0, nbytes_o), hipSuccess);
+    EXPECT_EQ(hipMemcpy(d_Q, h_Q.data(), nbytes_q, hipMemcpyHostToDevice), hipSuccess);
+    EXPECT_EQ(hipMemcpy(d_K, h_K.data(), nbytes_k, hipMemcpyHostToDevice), hipSuccess);
+    EXPECT_EQ(hipMemset(d_O, 0, nbytes_o), hipSuccess);
 
     // Build FmhaFwdParams
     FmhaFwdParams params{};
@@ -86,11 +86,11 @@ TEST(FmhaFwdD64Smoke, DISABLED_Softmax) {
     dim3 grid(H, m_tiles, B);
     dim3 block(kBlockSize);
     hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk0, grid, block, 0, nullptr, params);
-    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+    EXPECT_EQ(hipDeviceSynchronize(), hipSuccess);
 
     // Read back O (which contains softmax P as bf16)
     std::vector<uint16_t> h_O(nelems_o);
-    ASSERT_EQ(hipMemcpy(h_O.data(), d_O, nbytes_o, hipMemcpyDeviceToHost), hipSuccess);
+    EXPECT_EQ(hipMemcpy(h_O.data(), d_O, nbytes_o, hipMemcpyDeviceToHost), hipSuccess);
 
     // CPU reference: P = softmax(Q * K^T / sqrt(d))
     // 1. Compute S = Q * K^T / sqrt(d) using bf16 inputs, fp32 accumulation
@@ -220,14 +220,14 @@ TEST(FmhaFwdD64Smoke, BSHD) {
 
     // 3. Copy BSHD data to device
     void *d_Q = nullptr, *d_K = nullptr, *d_V = nullptr, *d_O = nullptr;
-    ASSERT_EQ(hipMalloc(&d_Q, nelems_q * 2), hipSuccess);
-    ASSERT_EQ(hipMalloc(&d_K, nelems_k * 2), hipSuccess);
-    ASSERT_EQ(hipMalloc(&d_V, nelems_v * 2), hipSuccess);
-    ASSERT_EQ(hipMalloc(&d_O, nelems_o * 2), hipSuccess);
-    ASSERT_EQ(hipMemcpy(d_Q, h_bshd_Q.data(), nelems_q * 2, hipMemcpyHostToDevice), hipSuccess);
-    ASSERT_EQ(hipMemcpy(d_K, h_bshd_K.data(), nelems_k * 2, hipMemcpyHostToDevice), hipSuccess);
-    ASSERT_EQ(hipMemcpy(d_V, h_bshd_V.data(), nelems_v * 2, hipMemcpyHostToDevice), hipSuccess);
-    ASSERT_EQ(hipMemset(d_O, 0, nelems_o * 2), hipSuccess);
+    EXPECT_EQ(hipMalloc(&d_Q, nelems_q * 2), hipSuccess);
+    EXPECT_EQ(hipMalloc(&d_K, nelems_k * 2), hipSuccess);
+    EXPECT_EQ(hipMalloc(&d_V, nelems_v * 2), hipSuccess);
+    EXPECT_EQ(hipMalloc(&d_O, nelems_o * 2), hipSuccess);
+    EXPECT_EQ(hipMemcpy(d_Q, h_bshd_Q.data(), nelems_q * 2, hipMemcpyHostToDevice), hipSuccess);
+    EXPECT_EQ(hipMemcpy(d_K, h_bshd_K.data(), nelems_k * 2, hipMemcpyHostToDevice), hipSuccess);
+    EXPECT_EQ(hipMemcpy(d_V, h_bshd_V.data(), nelems_v * 2, hipMemcpyHostToDevice), hipSuccess);
+    EXPECT_EQ(hipMemset(d_O, 0, nelems_o * 2), hipSuccess);
 
     // 4. Build kernel params with BSHD strides
     FmhaFwdParams kparams{};
@@ -262,11 +262,11 @@ TEST(FmhaFwdD64Smoke, BSHD) {
     dim3 grid(Hq, m_tiles, B);
     dim3 block(kBlockSize);
     hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk0, grid, block, 0, nullptr, kparams);
-    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+    EXPECT_EQ(hipDeviceSynchronize(), hipSuccess);
 
     // 6. Copy O back and rearrange BSHD -> BHSD
     std::vector<uint16_t> h_bshd_O(nelems_o);
-    ASSERT_EQ(hipMemcpy(h_bshd_O.data(), d_O, nelems_o * 2, hipMemcpyDeviceToHost), hipSuccess);
+    EXPECT_EQ(hipMemcpy(h_bshd_O.data(), d_O, nelems_o * 2, hipMemcpyDeviceToHost), hipSuccess);
 
     std::vector<uint16_t> h_bhsd_O(nelems_o);
     for (int b = 0; b < B; b++)
@@ -367,14 +367,14 @@ TEST(FmhaFwdD64Smoke, BSHDCausalGqa) {
     auto h_bshd_V = bhsd_to_bshd(h_bhsd_V, B, Hkv, Skv, D);
 
     void *d_Q = nullptr, *d_K = nullptr, *d_V = nullptr, *d_O = nullptr;
-    ASSERT_EQ(hipMalloc(&d_Q, nelems_q * 2), hipSuccess);
-    ASSERT_EQ(hipMalloc(&d_K, nelems_k * 2), hipSuccess);
-    ASSERT_EQ(hipMalloc(&d_V, nelems_v * 2), hipSuccess);
-    ASSERT_EQ(hipMalloc(&d_O, nelems_o * 2), hipSuccess);
-    ASSERT_EQ(hipMemcpy(d_Q, h_bshd_Q.data(), nelems_q * 2, hipMemcpyHostToDevice), hipSuccess);
-    ASSERT_EQ(hipMemcpy(d_K, h_bshd_K.data(), nelems_k * 2, hipMemcpyHostToDevice), hipSuccess);
-    ASSERT_EQ(hipMemcpy(d_V, h_bshd_V.data(), nelems_v * 2, hipMemcpyHostToDevice), hipSuccess);
-    ASSERT_EQ(hipMemset(d_O, 0, nelems_o * 2), hipSuccess);
+    EXPECT_EQ(hipMalloc(&d_Q, nelems_q * 2), hipSuccess);
+    EXPECT_EQ(hipMalloc(&d_K, nelems_k * 2), hipSuccess);
+    EXPECT_EQ(hipMalloc(&d_V, nelems_v * 2), hipSuccess);
+    EXPECT_EQ(hipMalloc(&d_O, nelems_o * 2), hipSuccess);
+    EXPECT_EQ(hipMemcpy(d_Q, h_bshd_Q.data(), nelems_q * 2, hipMemcpyHostToDevice), hipSuccess);
+    EXPECT_EQ(hipMemcpy(d_K, h_bshd_K.data(), nelems_k * 2, hipMemcpyHostToDevice), hipSuccess);
+    EXPECT_EQ(hipMemcpy(d_V, h_bshd_V.data(), nelems_v * 2, hipMemcpyHostToDevice), hipSuccess);
+    EXPECT_EQ(hipMemset(d_O, 0, nelems_o * 2), hipSuccess);
 
     FmhaFwdParams kparams{};
     kparams.q = reinterpret_cast<const __hip_bfloat16*>(d_Q);
@@ -406,10 +406,10 @@ TEST(FmhaFwdD64Smoke, BSHDCausalGqa) {
     dim3 grid(Hq, m_tiles, B);
     dim3 block(kBlockSize);
     hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk1, grid, block, 0, nullptr, kparams);
-    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+    EXPECT_EQ(hipDeviceSynchronize(), hipSuccess);
 
     std::vector<uint16_t> h_bshd_O(nelems_o);
-    ASSERT_EQ(hipMemcpy(h_bshd_O.data(), d_O, nelems_o * 2, hipMemcpyDeviceToHost), hipSuccess);
+    EXPECT_EQ(hipMemcpy(h_bshd_O.data(), d_O, nelems_o * 2, hipMemcpyDeviceToHost), hipSuccess);
 
     std::vector<uint16_t> h_bhsd_O(nelems_o);
     for (int b = 0; b < B; b++)
@@ -494,8 +494,8 @@ TEST_P(FmhaFwdD64Test, MatchesGpuRef) {
     // Allocate separate LSE buffer for kernel when LSE is enabled
     void* d_LSE_kern = nullptr;
     if (tc.lse) {
-        ASSERT_EQ(hipMalloc(&d_LSE_kern, bufs.sz_LSE * sizeof(float)), hipSuccess);
-        ASSERT_EQ(hipMemset(d_LSE_kern, 0, bufs.sz_LSE * sizeof(float)), hipSuccess);
+        EXPECT_EQ(hipMalloc(&d_LSE_kern, bufs.sz_LSE * sizeof(float)), hipSuccess);
+        EXPECT_EQ(hipMemset(d_LSE_kern, 0, bufs.sz_LSE * sizeof(float)), hipSuccess);
     }
 
     // Build FmhaFwdParams for our kernel
@@ -559,7 +559,7 @@ TEST_P(FmhaFwdD64Test, MatchesGpuRef) {
             hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk0, grid, block, 0, nullptr, kparams);
         }
     }
-    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+    EXPECT_EQ(hipDeviceSynchronize(), hipSuccess);
 
     // Copy output back
     bufs.copy_from_device();
@@ -594,14 +594,14 @@ TEST_P(FmhaFwdD64Test, MatchesGpuRef) {
         gp.d_seqstart_k = varlen ? reinterpret_cast<const uint32_t*>(bufs.d_kseq) : nullptr;
 
         gpu_ref_fmha_fwd(gp);
-        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+        EXPECT_EQ(hipDeviceSynchronize(), hipSuccess);
 
         // Copy both LSE buffers to host
         std::vector<float> h_lse_kern(bufs.sz_LSE);
         std::vector<float> h_lse_ref(bufs.sz_LSE);
-        ASSERT_EQ(hipMemcpy(h_lse_kern.data(), d_LSE_kern,
+        EXPECT_EQ(hipMemcpy(h_lse_kern.data(), d_LSE_kern,
                             bufs.sz_LSE * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
-        ASSERT_EQ(hipMemcpy(h_lse_ref.data(), bufs.d_LSE,
+        EXPECT_EQ(hipMemcpy(h_lse_ref.data(), bufs.d_LSE,
                             bufs.sz_LSE * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
 
         int lse_mismatches = 0;

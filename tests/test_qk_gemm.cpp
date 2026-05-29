@@ -11,7 +11,8 @@
 #include "refs/ref_qk_gemm.hpp"
 #include "kernels/qk_gemm.hpp"
 
-static std::string g_golden_dir;
+static std::string g_golden_full;
+static std::string g_golden_partial;
 
 namespace {
 
@@ -114,12 +115,12 @@ TEST(QkGemmFullTile, MatchesCpuRef) {
 }
 
 TEST(QkGemmFullTile, MatchesGolden) {
-    if (g_golden_dir.empty()) GTEST_SKIP() << "no --golden dir";
+    if (g_golden_full.empty()) GTEST_SKIP() << "no --golden-full dir";
     const int sq=64, sk=64, D=64;
     auto hQ=make_Q(sq,D), hK=make_K(sk,D);
     auto got=run_kernel(hQ,sq,hK,sk,D);
     std::vector<float> golden;
-    ASSERT_TRUE(load_golden_sacc(g_golden_dir, golden));
+    ASSERT_TRUE(load_golden_sacc(g_golden_full, golden));
     compare(got, golden, "full/golden");
 }
 
@@ -133,19 +134,50 @@ TEST(QkGemmPartialTile, MatchesCpuRef) {
 }
 
 TEST(QkGemmPartialTile, MatchesGolden) {
-    if (g_golden_dir.empty()) GTEST_SKIP() << "no --golden dir";
+    if (g_golden_partial.empty()) GTEST_SKIP() << "no --golden-partial dir";
     const int sq=17, sk=33, D=64;
     auto hQ=make_Q(sq,D), hK=make_K(sk,D);
     auto got=run_kernel(hQ,sq,hK,sk,D);
     std::vector<float> golden;
-    ASSERT_TRUE(load_golden_sacc(g_golden_dir, golden));
+    ASSERT_TRUE(load_golden_sacc(g_golden_partial, golden));
     compare(got, golden, "partial/golden");
+}
+
+// ---- Edge case tests (CPU ref only) ----
+
+TEST(QkGemmEdge, MinTile) {
+    const int sq=1, sk=1, D=64;
+    auto hQ=make_Q(sq,D), hK=make_K(sk,D);
+    auto got=run_kernel(hQ,sq,hK,sk,D);
+    std::vector<float> exp(kQKOutElems);
+    ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,exp.data());
+    compare(got, exp, "edge/min");
+}
+
+TEST(QkGemmEdge, FullM0) {
+    const int sq=128, sk=64, D=64;
+    auto hQ=make_Q(sq,D), hK=make_K(sk,D);
+    auto got=run_kernel(hQ,sq,hK,sk,D);
+    std::vector<float> exp(kQKOutElems);
+    ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,exp.data());
+    compare(got, exp, "edge/fullM0");
+}
+
+TEST(QkGemmEdge, SingleKCol) {
+    const int sq=64, sk=1, D=64;
+    auto hQ=make_Q(sq,D), hK=make_K(sk,D);
+    auto got=run_kernel(hQ,sq,hK,sk,D);
+    std::vector<float> exp(kQKOutElems);
+    ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,exp.data());
+    compare(got, exp, "edge/singleK");
 }
 
 int main(int argc, char** argv) {
     std::vector<char*> rest; rest.push_back(argv[0]);
     for (int i=1;i<argc;++i) {
-        if (std::strncmp(argv[i], "--golden=", 9)==0) g_golden_dir = argv[i]+9;
+        if (std::strncmp(argv[i], "--golden-full=", 14)==0) g_golden_full = argv[i]+14;
+        else if (std::strncmp(argv[i], "--golden-partial=", 17)==0) g_golden_partial = argv[i]+17;
+        else if (std::strncmp(argv[i], "--golden=", 9)==0) { g_golden_full = argv[i]+9; g_golden_partial = argv[i]+9; }
         else rest.push_back(argv[i]);
     }
     int rc=static_cast<int>(rest.size());

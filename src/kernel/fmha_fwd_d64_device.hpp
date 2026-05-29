@@ -7,7 +7,7 @@
 #include "fmha_fwd_d64_epilog.hpp"
 
 // Build an __amdgpu_buffer_rsrc_t from a pre-offset base pointer.
-__device__ inline __amdgpu_buffer_rsrc_t make_buffer_resource(const void* base) {
+__device__ __forceinline__ __amdgpu_buffer_rsrc_t make_buffer_resource(const void* base) {
     return __builtin_amdgcn_make_buffer_rsrc(
         const_cast<void*>(base), 0, 0xFFFFFFFF, 0x00027000);
 }
@@ -22,7 +22,7 @@ __device__ inline __amdgpu_buffer_rsrc_t make_buffer_resource(const void* base) 
 //   4. GEMM1: O_acc += P * V (bpermute-based, correctness first)
 // Epilog: O = O_acc / row_sum, cast to bf16, store to DRAM.
 template <bool HasMask, bool IsVarlen>
-__device__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
+__device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
                                     char* lds,
                                     int batch_idx,
                                     int head_idx,
@@ -80,6 +80,8 @@ __device__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     // ---- Build SRDs ----
     auto srd_q = make_buffer_resource(q_base);
     auto srd_k = make_buffer_resource(k_base);
+    auto srd_v = make_buffer_resource(v_base);
+    auto srd_o = make_buffer_resource(o_base);
 
     // ---- Load Q: 8 x buffer_load_b128 = 64 bf16 per thread ----
     const int q_row_bytes = m_row * (params.stride_q * 2);
@@ -95,6 +97,8 @@ __device__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             q_regs[i] = v4i{0, 0, 0, 0};
         }
     }
+
+    __builtin_amdgcn_sched_barrier(0);  // Phase 1: Q load complete
 
     // ---- Initialize online softmax state ----
     float rmax[16], rsum[16];
@@ -126,86 +130,90 @@ __device__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             if (kv_offset > last_q_row + shift) continue;
         }
 
-        // ---- Copy K[kv_tile] to LDS (2 k0 slices) ----
+        // ---- Phase: K copy to LDS ----
         copy_k_to_lds_2x_guarded(srd_k, params.stride_k, lds,
                                   lds_buf0_bytes, lds_buf1_bytes,
                                   kv_offset, seqlen_k);
         s_waitcnt_lgkmcnt_0();
         s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
 
-        // ---- GEMM0: S_acc = Q x K^T ----
-        v16f s_acc_n0 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-        v16f s_acc_n1 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-
-        gemm0(s_acc_n0, s_acc_n1, q_regs, lds, lds_buf0_bytes, lds_buf1_bytes, lane_id);
-
-        // ---- Scale ----
-        for (int i = 0; i < 16; i++) {
-            s_acc_n0[i] *= params.scale;
-            s_acc_n1[i] *= params.scale;
-        }
-
-        // ---- Mask out-of-bounds seqlen_k positions ----
+        // ---- s_acc scope: GEMM0 → scale/mask → softmax → V → GEMM1 ----
         {
-            int n_pos = lane_id & 31;
-            // s_acc_n0[i] is at seqlen_k position = n_pos
-            // s_acc_n1[i] is at seqlen_k position = 32 + n_pos
-            int seqk_n0 = kv_offset + n_pos;
-            int seqk_n1 = kv_offset + 32 + n_pos;
-            if (seqk_n0 >= seqlen_k) {
-                for (int i = 0; i < 16; i++) s_acc_n0[i] = -INFINITY;
-            }
-            if (seqk_n1 >= seqlen_k) {
-                for (int i = 0; i < 16; i++) s_acc_n1[i] = -INFINITY;
-            }
-        }
+            v16f s_acc_n0 = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+            v16f s_acc_n1 = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
 
-        // ---- Causal mask: mask positions where k_col > q_row + shift ----
-        if constexpr (HasMask) {
-            int k_sub = lane_id >> 5;
-            int n_pos = lane_id & 31;
-            int n_n0  = kv_offset + n_pos;
-            int n_n1  = kv_offset + 32 + n_pos;
-            int shift = seqlen_k - seqlen_q;
+            // ---- Phase: GEMM0 ----
+            gemm0(s_acc_n0, s_acc_n1, q_regs, lds,
+                  lds_buf0_bytes, lds_buf1_bytes, lane_id);
+            __builtin_amdgcn_sched_barrier(0);
+
+            // ---- Phase: Scale + mask ----
+            #pragma unroll
             for (int i = 0; i < 16; i++) {
-                int m_idx = m_tile_idx * kM0 + warp_id * 32 + k_sub * 16 + i;
-                if (n_n0 > m_idx + shift) s_acc_n0[i] = -INFINITY;
-                if (n_n1 > m_idx + shift) s_acc_n1[i] = -INFINITY;
+                s_acc_n0[i] *= params.scale;
+                s_acc_n1[i] *= params.scale;
             }
-        }
+            {
+                int n_pos = lane_id & 31;
+                int seqk_n0 = kv_offset + n_pos;
+                int seqk_n1 = kv_offset + 32 + n_pos;
+                if (seqk_n0 >= seqlen_k) {
+                    #pragma unroll
+                    for (int i = 0; i < 16; i++) s_acc_n0[i] = -INFINITY;
+                }
+                if (seqk_n1 >= seqlen_k) {
+                    #pragma unroll
+                    for (int i = 0; i < 16; i++) s_acc_n1[i] = -INFINITY;
+                }
+            }
+            if constexpr (HasMask) {
+                int k_sub = lane_id >> 5;
+                int n_pos = lane_id & 31;
+                int n_n0  = kv_offset + n_pos;
+                int n_n1  = kv_offset + 32 + n_pos;
+                int shift = seqlen_k - seqlen_q;
+                for (int i = 0; i < 16; i++) {
+                    int m_idx = m_tile_idx * kM0 + warp_id * 32 + k_sub * 16 + i;
+                    if (n_n0 > m_idx + shift) s_acc_n0[i] = -INFINITY;
+                    if (n_n1 > m_idx + shift) s_acc_n1[i] = -INFINITY;
+                }
+            }
 
-        // ---- Online softmax update ----
-        float new_max[16];
-        softmax_row_max(new_max, s_acc_n0, s_acc_n1, lane_id);
+            // ---- Phase: Softmax ----
+            {
+                float new_max[16];
+                softmax_row_max(new_max, s_acc_n0, s_acc_n1, lane_id);
+                // Merge new_max with rmax: keep rmax when new tile is fully
+                // masked (-INFINITY), preventing exp2f(finite - (-INF)) = INF
+                // from destroying accumulated o_acc and rsum.
+                for (int i = 0; i < 16; i++) {
+                    if (new_max[i] == -INFINITY)
+                        new_max[i] = rmax[i];
+                }
+                if (kv_tile > 0) {
+                    rescale_o_acc(o_acc_n0, o_acc_n1, rmax, new_max);
+                    for (int i = 0; i < 16; i++)
+                        rsum[i] *= __builtin_amdgcn_exp2f(rmax[i] - new_max[i]);
+                }
+                softmax_exp(s_acc_n0, s_acc_n1, new_max);
+                float new_sum[16];
+                softmax_row_sum(new_sum, s_acc_n0, s_acc_n1, lane_id);
+                for (int i = 0; i < 16; i++)
+                    rsum[i] += new_sum[i];
+                for (int i = 0; i < 16; i++)
+                    rmax[i] = new_max[i];
+            } // new_max, new_sum dead
+            __builtin_amdgcn_sched_barrier(0);
 
-        // Rescale O_acc and old_sum when max changes
-        if (kv_tile > 0) {
-            rescale_o_acc(o_acc_n0, o_acc_n1, rmax, new_max);
-            for (int i = 0; i < 16; i++)
-                rsum[i] *= __builtin_amdgcn_exp2f(rmax[i] - new_max[i]);
-        }
+            // ---- GEMM1: O_acc += P * V (bpermute-based) ----
+            gemm1_bpermute(o_acc_n0, o_acc_n1, s_acc_n0, s_acc_n1,
+                           v_base, params.stride_v, kv_offset, seqlen_k,
+                           lane_id);
+        } // s_acc_n0, s_acc_n1 DEAD
+        __builtin_amdgcn_sched_barrier(0);
 
-        // P = exp2(S - new_max)
-        softmax_exp(s_acc_n0, s_acc_n1, new_max);
-
-        // Accumulate row sums
-        float new_sum[16];
-        softmax_row_sum(new_sum, s_acc_n0, s_acc_n1, lane_id);
-        for (int i = 0; i < 16; i++)
-            rsum[i] += new_sum[i];
-
-        // Update max
-        for (int i = 0; i < 16; i++)
-            rmax[i] = new_max[i];
-
-        // ---- GEMM1: O_acc += P * V (bpermute-based) ----
-        // s_acc_n0/n1 now contain P (unnormalized exp values).
-        // V is loaded directly from DRAM per seqlen_k position.
-        gemm1_bpermute(o_acc_n0, o_acc_n1, s_acc_n0, s_acc_n1,
-                       v_base, params.stride_v, kv_offset, seqlen_k,
-                       lane_id);
-
-        // Barrier before next iteration's K copy overwrites LDS
+        // Barrier before next iteration's K copy
         s_barrier();
     }
 

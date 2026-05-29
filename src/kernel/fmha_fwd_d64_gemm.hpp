@@ -6,7 +6,7 @@ typedef float v16f __attribute__((ext_vector_type(16)));
 typedef short v4h __attribute__((ext_vector_type(4)));
 
 // Pack two int32 values (containing 4 bf16) into short4 for MFMA.
-__device__ inline v4h pack_short4(int lo, int hi) {
+__device__ __forceinline__ v4h pack_short4(int lo, int hi) {
     v4h r;
     __builtin_memcpy(&r, &lo, 4);
     __builtin_memcpy(reinterpret_cast<char*>(&r) + 4, &hi, 4);
@@ -78,6 +78,70 @@ __device__ inline void gemm0(v16f& s_acc_n0, v16f& s_acc_n1,
     gemm0_k0(s_acc_n0, s_acc_n1, lds, lds_buf1_bytes, q_regs, 4, lane_id);
 }
 
+// ---- NEW GEMM0 for 4-reg Q load (interleaved K processing) ----
+//
+// With k_sub-dependent Q voffset, each k_sub half loads non-contiguous
+// K positions: k_sub=0 → {0..7,16..23,32..39,48..55}, k_sub=1 → the gaps.
+// GEMM0 processes K in interleaved order to match, with each ds_read_b128
+// feeding 2 MFMAs (dw[0:1] then dw[2:3]).
+//
+// Per kstep: K LDS read at k_pos = kstep*16 + k_sub*8 (k_sub-dependent).
+//   Both halves of the read (dw[0:1] and dw[2:3]) are consumed by
+//   separate MFMA calls, paired with matching Q dword halves.
+//
+// 4 ksteps × 2 passes × 2 N sub-tiles = 16 MFMA total.
+// 4 ksteps × 2 reads (n0+n1) = 8 reads total (halved from 16).
+
+__device__ __forceinline__ void gemm0_interleaved(
+                                          v16f& s_acc_n0, v16f& s_acc_n1,
+                                          const v4i* q_regs,
+                                          char* lds,
+                                          int lds_buf0_bytes,
+                                          int lds_buf1_bytes,
+                                          int lane_id) {
+    int n_local = lane_id & 31;
+    int k_sub   = lane_id >> 5;
+
+    #pragma unroll
+    for (int kstep = 0; kstep < 4; kstep++) {
+        // K position: k_sub-dependent, interleaved across headdim
+        int k_lds_pos = kstep * 16 + k_sub * 8;
+
+        // Select LDS buffer: K cols 0..31 in buf0, 32..63 in buf1
+        int lds_buf = (k_lds_pos < 32) ? lds_buf0_bytes : lds_buf1_bytes;
+        int k_in_buf = k_lds_pos & 31;
+
+        // K LDS reads (shared between 2 MFMA passes)
+        int off_n0 = lds_buf + k_lds_offset(n_local, k_in_buf) * 2;
+        v4i k_n0 = *reinterpret_cast<const v4i*>(lds + off_n0);
+
+        int off_n1 = lds_buf + k_lds_offset(32 + n_local, k_in_buf) * 2;
+        v4i k_n1 = *reinterpret_cast<const v4i*>(lds + off_n1);
+
+        v4i q_reg = q_regs[kstep];
+
+        // Pass 0: dw[0:1] — first 4 bf16 of each 8-wide chunk
+        {
+            v4h a_n0 = pack_short4(k_n0[0], k_n0[1]);
+            v4h a_n1 = pack_short4(k_n1[0], k_n1[1]);
+            v4h b    = pack_short4(q_reg[0], q_reg[1]);
+
+            s_acc_n0 = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(a_n0, b, s_acc_n0, 0, 0, 0);
+            s_acc_n1 = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(a_n1, b, s_acc_n1, 0, 0, 0);
+        }
+
+        // Pass 1: dw[2:3] — last 4 bf16 of each 8-wide chunk
+        {
+            v4h a_n0 = pack_short4(k_n0[2], k_n0[3]);
+            v4h a_n1 = pack_short4(k_n1[2], k_n1[3]);
+            v4h b    = pack_short4(q_reg[2], q_reg[3]);
+
+            s_acc_n0 = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(a_n0, b, s_acc_n0, 0, 0, 0);
+            s_acc_n1 = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(a_n1, b, s_acc_n1, 0, 0, 0);
+        }
+    }
+}
+
 // ---- GEMM1: O_acc += P x V (scalar bpermute-based, correctness first) ----
 //
 // Computes O[m_q, hdim] += P[m_q, seqk] * V[seqk, hdim] for all seqk
@@ -100,13 +164,13 @@ __device__ inline void gemm0(v16f& s_acc_n0, v16f& s_acc_n1,
 // Truncates P to bf16 before multiply (matching GPU reference precision).
 
 // Convert bf16 (in uint16_t) to float on device.
-__device__ inline float bf16_to_f32_dev(uint16_t b) {
+__device__ __forceinline__ float bf16_to_f32_dev(uint16_t b) {
     uint32_t u = static_cast<uint32_t>(b) << 16;
     return __builtin_bit_cast(float, u);
 }
 
 // Convert float to bf16 by truncation on device.
-__device__ inline uint16_t f32_to_bf16_dev(float f) {
+__device__ __forceinline__ uint16_t f32_to_bf16_dev(float f) {
     uint32_t u = __builtin_bit_cast(uint32_t, f);
     return static_cast<uint16_t>(u >> 16);
 }
@@ -150,4 +214,126 @@ __device__ inline void gemm1_bpermute(v16f& o_acc_n0, v16f& o_acc_n1,
             o_acc_n1[i] += p_trunc * v_val_n1;
         }
     }
+}
+
+// ================================================================
+// NEW ISA-matched GEMM1 via MFMA.
+// Old gemm1_bpermute above is kept until device.hpp is re-wired.
+// ================================================================
+
+// ---- Pack P (fp32) into bf16 short4 for MFMA B operand ----
+//
+// Mirrors Q's packing in GEMM0: 4 consecutive P registers → 1 short4.
+// fp32 → bf16 truncation via v_perm_b32 with selector 0x07060302.
+//
+// For kInner step s (0..3):
+//   p_bf16_lo = perm(p_acc[2*s+1], p_acc[2*s], 0x07060302)
+//   p_bf16_hi = perm(p_acc[2*s+3], p_acc[2*s+2], 0x07060302)
+//   result = pack_short4(p_bf16_lo, p_bf16_hi)
+
+__device__ __forceinline__ void pack_p_to_bf16(
+                                       v4h (&p_packed)[8],
+                                       const v16f& p_n0,
+                                       const v16f& p_n1) {
+    constexpr unsigned kFp32ToBf16Sel = 0x07060302;
+
+    // k1=0: from p_n0[0..15]
+    for (int s = 0; s < 4; s++) {
+        unsigned lo = __builtin_amdgcn_perm(
+            __builtin_bit_cast(unsigned, p_n0[2 * s + 1]),
+            __builtin_bit_cast(unsigned, p_n0[2 * s]),
+            kFp32ToBf16Sel);
+        unsigned hi = __builtin_amdgcn_perm(
+            __builtin_bit_cast(unsigned, p_n0[2 * s + 3]),
+            __builtin_bit_cast(unsigned, p_n0[2 * s + 2]),
+            kFp32ToBf16Sel);
+        p_packed[s] = pack_short4(lo, hi);
+    }
+
+    // k1=1: from p_n1[0..15]
+    for (int s = 0; s < 4; s++) {
+        unsigned lo = __builtin_amdgcn_perm(
+            __builtin_bit_cast(unsigned, p_n1[2 * s + 1]),
+            __builtin_bit_cast(unsigned, p_n1[2 * s]),
+            kFp32ToBf16Sel);
+        unsigned hi = __builtin_amdgcn_perm(
+            __builtin_bit_cast(unsigned, p_n1[2 * s + 3]),
+            __builtin_bit_cast(unsigned, p_n1[2 * s + 2]),
+            kFp32ToBf16Sel);
+        p_packed[4 + s] = pack_short4(lo, hi);
+    }
+}
+
+// ---- GEMM1 k1 iteration (one half of K dimension) ----
+//
+// Same structure as gemm0_k0: 4 kInner steps, each with ds_read_b128
+// for V (A operand) and pre-packed P (B operand).
+//
+// V LDS read uses padded layout (same formula as K in GEMM0):
+//   lds_addr = buf_base + k_lds_offset(n, k_start) * 2
+//
+// A operand from V: pack_short4(v_data[k_sub*2], v_data[k_sub*2+1])
+// B operand from P: p_packed[p_base + kstep]
+
+__device__ __forceinline__ void gemm1_k1(
+                                 v16f& o_acc_n0, v16f& o_acc_n1,
+                                 char* lds,
+                                 int lds_buf_bytes,
+                                 const v4h* p_packed,
+                                 int p_base,
+                                 int lane_id) {
+    int n_local = lane_id & 31;
+    int k_sub   = lane_id >> 5;
+
+    #pragma unroll
+    for (int kstep = 0; kstep < 4; kstep++) {
+        int k_start = kstep * 8;
+
+        // LDS read for N sub-tile 0 (hdim 0..31)
+        int off_n0 = lds_buf_bytes + k_lds_offset(n_local, k_start) * 2;
+        v4i v_n0 = *reinterpret_cast<const v4i*>(lds + off_n0);
+
+        // LDS read for N sub-tile 1 (hdim 32..63)
+        int off_n1 = lds_buf_bytes + k_lds_offset(32 + n_local, k_start) * 2;
+        v4i v_n1 = *reinterpret_cast<const v4i*>(lds + off_n1);
+
+        // A operand (V data) — select k_sub half
+        v4h a_n0 = pack_short4(v_n0[k_sub * 2], v_n0[k_sub * 2 + 1]);
+        v4h a_n1 = pack_short4(v_n1[k_sub * 2], v_n1[k_sub * 2 + 1]);
+
+        // B operand (P data) — pre-packed
+        v4h b_val = p_packed[p_base + kstep];
+
+        // MFMA: O[32,32] += V[32,8] * P[8,32]
+        o_acc_n0 = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(a_n0, b_val, o_acc_n0, 0, 0, 0);
+        o_acc_n1 = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(a_n1, b_val, o_acc_n1, 0, 0, 0);
+    }
+}
+
+// Full GEMM1: pack P, then process both k1 iterations.
+//
+// V is read from LDS buffers (already stored by v_repack_store):
+//   k1=0: V in lds_v_buf0 (e.g., buf1 offset 4608)
+//   k1=1: V in lds_v_buf1 (e.g., buf0 offset 0)
+//
+// Total: 16 MFMA (2 k1 × 4 kInner × 2 N sub-tiles).
+
+__device__ __forceinline__ void gemm1(
+                              v16f& o_acc_n0, v16f& o_acc_n1,
+                              const v16f& p_n0, const v16f& p_n1,
+                              char* lds,
+                              int lds_v_buf0_bytes,
+                              int lds_v_buf1_bytes,
+                              int lane_id) {
+    // Pack P from fp32 to bf16 short4 (8 operands total)
+    v4h p_packed[8];
+    pack_p_to_bf16(p_packed, p_n0, p_n1);
+
+    // k1=0: V from lds_v_buf0, P from p_packed[0..3]
+    gemm1_k1(o_acc_n0, o_acc_n1, lds, lds_v_buf0_bytes, p_packed, 0, lane_id);
+
+    __builtin_amdgcn_sched_barrier(0);
+
+    // k1=1: V from lds_v_buf1, P from p_packed[4..7]
+    gemm1_k1(o_acc_n0, o_acc_n1, lds, lds_v_buf1_bytes, p_packed, 4, lane_id);
 }

@@ -40,26 +40,25 @@ std::vector<float> compute_s_acc(const std::vector<uint16_t>& hQ, int sq,
 }
 
 // Run the row_max GPU kernel. Input: S_acc (256*32 fp32). Output: rmax (256 fp32).
-std::vector<float> run_kernel(const std::vector<float>& s_acc) {
+void run_kernel(const std::vector<float>& s_acc, std::vector<float>& hRmax) {
+    hRmax.resize(kRowMaxOutElems);
     void *dSacc = nullptr, *dRmax = nullptr;
-    EXPECT_EQ(hipMalloc(&dSacc, s_acc.size() * sizeof(float)), hipSuccess);
-    EXPECT_EQ(hipMalloc(&dRmax, kRowMaxOutElems * sizeof(float)), hipSuccess);
-    EXPECT_EQ(hipMemcpy(dSacc, s_acc.data(), s_acc.size() * sizeof(float),
+    ASSERT_EQ(hipMalloc(&dSacc, s_acc.size() * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dRmax, kRowMaxOutElems * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMemcpy(dSacc, s_acc.data(), s_acc.size() * sizeof(float),
                         hipMemcpyHostToDevice), hipSuccess);
-    EXPECT_EQ(hipMemset(dRmax, 0, kRowMaxOutElems * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMemset(dRmax, 0, kRowMaxOutElems * sizeof(float)), hipSuccess);
 
     hipLaunchKernelGGL(test_row_max_kernel, dim3(1), dim3(256), 0, nullptr,
                        reinterpret_cast<const float*>(dSacc),
                        reinterpret_cast<float*>(dRmax));
-    EXPECT_EQ(hipGetLastError(), hipSuccess);
-    EXPECT_EQ(hipDeviceSynchronize(), hipSuccess);
+    ASSERT_EQ(hipGetLastError(), hipSuccess);
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 
-    std::vector<float> hRmax(kRowMaxOutElems);
-    EXPECT_EQ(hipMemcpy(hRmax.data(), dRmax, kRowMaxOutElems * sizeof(float),
+    ASSERT_EQ(hipMemcpy(hRmax.data(), dRmax, kRowMaxOutElems * sizeof(float),
                         hipMemcpyDeviceToHost), hipSuccess);
     hipFree(dSacc);
     hipFree(dRmax);
-    return hRmax;
 }
 
 // Load golden RMAX (dump_reg slot 2, 1 f32 reg per thread).
@@ -139,7 +138,8 @@ TEST(RowMaxFullTile, MatchesCpuRef) {
     auto hQ = make_Q(sq, D);
     auto hK = make_K(sk, D);
     auto s_acc = compute_s_acc(hQ, sq, hK, sk, D);
-    auto got = run_kernel(s_acc);
+    std::vector<float> got;
+    run_kernel(s_acc, got);
 
     std::vector<float> exp(kRowMaxOutElems);
     ref_row_max(s_acc.data(), exp.data());
@@ -151,7 +151,8 @@ TEST(RowMaxFullTile, MatchesGolden) {
     // Use golden S_ACC as input (not CPU-computed S_ACC)
     std::vector<float> golden_sacc;
     ASSERT_TRUE(load_golden_sacc(g_golden_full, golden_sacc));
-    auto got = run_kernel(golden_sacc);
+    std::vector<float> got;
+    run_kernel(golden_sacc, got);
 
     std::vector<float> golden_rmax;
     ASSERT_TRUE(load_golden_rmax(g_golden_full, golden_rmax));
@@ -165,7 +166,8 @@ TEST(RowMaxPartialTile, MatchesCpuRef) {
     auto hQ = make_Q(sq, D);
     auto hK = make_K(sk, D);
     auto s_acc = compute_s_acc(hQ, sq, hK, sk, D);
-    auto got = run_kernel(s_acc);
+    std::vector<float> got;
+    run_kernel(s_acc, got);
 
     std::vector<float> exp(kRowMaxOutElems);
     ref_row_max(s_acc.data(), exp.data());
@@ -176,7 +178,8 @@ TEST(RowMaxPartialTile, MatchesGolden) {
     if (g_golden_partial.empty()) GTEST_SKIP() << "no --golden-partial dir";
     std::vector<float> golden_sacc;
     ASSERT_TRUE(load_golden_sacc(g_golden_partial, golden_sacc));
-    auto got = run_kernel(golden_sacc);
+    std::vector<float> got;
+    run_kernel(golden_sacc, got);
 
     std::vector<float> golden_rmax;
     ASSERT_TRUE(load_golden_rmax(g_golden_partial, golden_rmax));
@@ -189,7 +192,8 @@ TEST(RowMaxEdge, MinTile) {
     const int sq=1, sk=1, D=64;
     auto hQ=make_Q(sq,D), hK=make_K(sk,D);
     auto s_acc=compute_s_acc(hQ,sq,hK,sk,D);
-    auto got=run_kernel(s_acc);
+    std::vector<float> got;
+    run_kernel(s_acc, got);
     std::vector<float> exp(kRowMaxOutElems);
     ref_row_max(s_acc.data(), exp.data());
     compare_exact(got, exp, "edge/min");
@@ -199,7 +203,8 @@ TEST(RowMaxEdge, FullM0) {
     const int sq=128, sk=64, D=64;
     auto hQ=make_Q(sq,D), hK=make_K(sk,D);
     auto s_acc=compute_s_acc(hQ,sq,hK,sk,D);
-    auto got=run_kernel(s_acc);
+    std::vector<float> got;
+    run_kernel(s_acc, got);
     std::vector<float> exp(kRowMaxOutElems);
     ref_row_max(s_acc.data(), exp.data());
     compare_exact(got, exp, "edge/fullM0");
@@ -209,7 +214,8 @@ TEST(RowMaxEdge, SingleKCol) {
     const int sq=64, sk=1, D=64;
     auto hQ=make_Q(sq,D), hK=make_K(sk,D);
     auto s_acc=compute_s_acc(hQ,sq,hK,sk,D);
-    auto got=run_kernel(s_acc);
+    std::vector<float> got;
+    run_kernel(s_acc, got);
     std::vector<float> exp(kRowMaxOutElems);
     ref_row_max(s_acc.data(), exp.data());
     compare_exact(got, exp, "edge/singleK");

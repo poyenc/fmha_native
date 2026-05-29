@@ -45,28 +45,28 @@ std::vector<float> compute_p(int sq, int sk, int D) {
     return p;
 }
 
-std::vector<float> run_kernel(const std::vector<float>& p,
-                              const std::vector<uint16_t>& hV,
-                              int stride_v, int seqlen_k) {
+void run_kernel(const std::vector<float>& p,
+                const std::vector<uint16_t>& hV,
+                int stride_v, int seqlen_k,
+                std::vector<float>& hOut) {
+    hOut.resize(kPVOutElems);
     void *dP = nullptr, *dV = nullptr, *dOut = nullptr;
-    EXPECT_EQ(hipMalloc(&dP, p.size() * sizeof(float)), hipSuccess);
-    EXPECT_EQ(hipMalloc(&dV, hV.size() * 2), hipSuccess);
-    EXPECT_EQ(hipMalloc(&dOut, kPVOutElems * sizeof(float)), hipSuccess);
-    EXPECT_EQ(hipMemcpy(dP, p.data(), p.size() * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
-    EXPECT_EQ(hipMemcpy(dV, hV.data(), hV.size() * 2, hipMemcpyHostToDevice), hipSuccess);
-    EXPECT_EQ(hipMemset(dOut, 0, kPVOutElems * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dP, p.size() * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dV, hV.size() * 2), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dOut, kPVOutElems * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMemcpy(dP, p.data(), p.size() * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemcpy(dV, hV.data(), hV.size() * 2, hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemset(dOut, 0, kPVOutElems * sizeof(float)), hipSuccess);
 
     hipLaunchKernelGGL(test_pv_gemm_kernel, dim3(1), dim3(256), 0, nullptr,
                        (const float*)dP, (const uint16_t*)dV, (float*)dOut,
                        stride_v, seqlen_k);
-    EXPECT_EQ(hipGetLastError(), hipSuccess);
-    EXPECT_EQ(hipDeviceSynchronize(), hipSuccess);
+    ASSERT_EQ(hipGetLastError(), hipSuccess);
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 
-    std::vector<float> hOut(kPVOutElems);
-    EXPECT_EQ(hipMemcpy(hOut.data(), dOut, kPVOutElems * sizeof(float),
+    ASSERT_EQ(hipMemcpy(hOut.data(), dOut, kPVOutElems * sizeof(float),
                         hipMemcpyDeviceToHost), hipSuccess);
     hipFree(dP); hipFree(dV); hipFree(dOut);
-    return hOut;
 }
 
 bool load_golden_slot(const std::string& dir, int slot, int regs,
@@ -136,7 +136,8 @@ TEST(PvGemmFullTile, MatchesCpuRef) {
     const int sq = 64, sk = 64, D = 64;
     auto p = compute_p(sq, sk, D);
     auto hV = make_V(sk, D);
-    auto got = run_kernel(p, hV, D, sk);
+    std::vector<float> got;
+    run_kernel(p, hV, D, sk, got);
     std::vector<float> exp(kPVOutElems);
     ref_pv_gemm(p.data(), hV.data(), D, sk, exp.data());
     compare(got, exp, "full/cpuref");
@@ -148,7 +149,8 @@ TEST(PvGemmFullTile, MatchesGolden) {
     std::vector<float> golden_p;
     ASSERT_TRUE(load_golden_slot(g_golden_full, 3, 32, golden_p));
     auto hV = make_V(sk, D);
-    auto got = run_kernel(golden_p, hV, D, sk);
+    std::vector<float> got;
+    run_kernel(golden_p, hV, D, sk, got);
     std::vector<float> golden_oacc;
     ASSERT_TRUE(load_golden_slot(g_golden_full, 5, 32, golden_oacc));
     compare_exact(got, golden_oacc, "full/golden");
@@ -158,7 +160,8 @@ TEST(PvGemmPartialTile, MatchesCpuRef) {
     const int sq = 17, sk = 33, D = 64;
     auto p = compute_p(sq, sk, D);
     auto hV = make_V(sk, D);
-    auto got = run_kernel(p, hV, D, sk);
+    std::vector<float> got;
+    run_kernel(p, hV, D, sk, got);
     std::vector<float> exp(kPVOutElems);
     ref_pv_gemm(p.data(), hV.data(), D, sk, exp.data());
     compare(got, exp, "partial/cpuref");
@@ -170,7 +173,8 @@ TEST(PvGemmPartialTile, MatchesGolden) {
     std::vector<float> golden_p;
     ASSERT_TRUE(load_golden_slot(g_golden_partial, 3, 32, golden_p));
     auto hV = make_V(sk, D);
-    auto got = run_kernel(golden_p, hV, D, sk);
+    std::vector<float> got;
+    run_kernel(golden_p, hV, D, sk, got);
     std::vector<float> golden_oacc;
     ASSERT_TRUE(load_golden_slot(g_golden_partial, 5, 32, golden_oacc));
     compare_exact(got, golden_oacc, "partial/golden");
@@ -181,7 +185,8 @@ TEST(PvGemmPartialTile, MatchesGolden) {
 TEST(PvGemmEdge, MinTile) {
     const int sq=1, sk=1, D=64;
     auto p=compute_p(sq,sk,D); auto hV=make_V(sk,D);
-    auto got=run_kernel(p,hV,D,sk);
+    std::vector<float> got;
+    run_kernel(p,hV,D,sk,got);
     std::vector<float> exp(kPVOutElems);
     ref_pv_gemm(p.data(),hV.data(),D,sk,exp.data());
     compare(got,exp,"edge/min");
@@ -190,7 +195,8 @@ TEST(PvGemmEdge, MinTile) {
 TEST(PvGemmEdge, FullM0) {
     const int sq=128, sk=64, D=64;
     auto p=compute_p(sq,sk,D); auto hV=make_V(sk,D);
-    auto got=run_kernel(p,hV,D,sk);
+    std::vector<float> got;
+    run_kernel(p,hV,D,sk,got);
     std::vector<float> exp(kPVOutElems);
     ref_pv_gemm(p.data(),hV.data(),D,sk,exp.data());
     compare(got,exp,"edge/fullM0");
@@ -199,7 +205,8 @@ TEST(PvGemmEdge, FullM0) {
 TEST(PvGemmEdge, SingleKCol) {
     const int sq=64, sk=1, D=64;
     auto p=compute_p(sq,sk,D); auto hV=make_V(sk,D);
-    auto got=run_kernel(p,hV,D,sk);
+    std::vector<float> got;
+    run_kernel(p,hV,D,sk,got);
     std::vector<float> exp(kPVOutElems);
     ref_pv_gemm(p.data(),hV.data(),D,sk,exp.data());
     compare(got,exp,"edge/singleK");

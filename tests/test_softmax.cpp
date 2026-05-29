@@ -35,40 +35,39 @@ struct SoftmaxResult {
     std::vector<float> rsum;   // 256
 };
 
-SoftmaxResult run_kernel(const std::vector<float>& s_acc,
-                         int seqlen_k, int kv_offset, float scale_s) {
+void run_kernel(const std::vector<float>& s_acc,
+                int seqlen_k, int kv_offset, float scale_s,
+                SoftmaxResult& res) {
     const int p_size = 256 * 32;
     const int scalar_size = 256;
 
     void *dSacc = nullptr, *dP = nullptr, *dRmax = nullptr, *dRsum = nullptr;
-    EXPECT_EQ(hipMalloc(&dSacc, s_acc.size() * sizeof(float)), hipSuccess);
-    EXPECT_EQ(hipMalloc(&dP, p_size * sizeof(float)), hipSuccess);
-    EXPECT_EQ(hipMalloc(&dRmax, scalar_size * sizeof(float)), hipSuccess);
-    EXPECT_EQ(hipMalloc(&dRsum, scalar_size * sizeof(float)), hipSuccess);
-    EXPECT_EQ(hipMemcpy(dSacc, s_acc.data(), s_acc.size() * sizeof(float),
+    ASSERT_EQ(hipMalloc(&dSacc, s_acc.size() * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dP, p_size * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dRmax, scalar_size * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dRsum, scalar_size * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMemcpy(dSacc, s_acc.data(), s_acc.size() * sizeof(float),
                         hipMemcpyHostToDevice), hipSuccess);
-    EXPECT_EQ(hipMemset(dP, 0, p_size * sizeof(float)), hipSuccess);
-    EXPECT_EQ(hipMemset(dRmax, 0, scalar_size * sizeof(float)), hipSuccess);
-    EXPECT_EQ(hipMemset(dRsum, 0, scalar_size * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMemset(dP, 0, p_size * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMemset(dRmax, 0, scalar_size * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMemset(dRsum, 0, scalar_size * sizeof(float)), hipSuccess);
 
     hipLaunchKernelGGL(test_softmax_kernel, dim3(1), dim3(256), 0, nullptr,
                        (const float*)dSacc, (float*)dP, (float*)dRmax, (float*)dRsum,
                        seqlen_k, kv_offset, scale_s);
-    EXPECT_EQ(hipGetLastError(), hipSuccess);
-    EXPECT_EQ(hipDeviceSynchronize(), hipSuccess);
+    ASSERT_EQ(hipGetLastError(), hipSuccess);
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 
-    SoftmaxResult res;
     res.p.resize(p_size);
     res.rmax.resize(scalar_size);
     res.rsum.resize(scalar_size);
-    EXPECT_EQ(hipMemcpy(res.p.data(), dP, p_size * sizeof(float),
+    ASSERT_EQ(hipMemcpy(res.p.data(), dP, p_size * sizeof(float),
                         hipMemcpyDeviceToHost), hipSuccess);
-    EXPECT_EQ(hipMemcpy(res.rmax.data(), dRmax, scalar_size * sizeof(float),
+    ASSERT_EQ(hipMemcpy(res.rmax.data(), dRmax, scalar_size * sizeof(float),
                         hipMemcpyDeviceToHost), hipSuccess);
-    EXPECT_EQ(hipMemcpy(res.rsum.data(), dRsum, scalar_size * sizeof(float),
+    ASSERT_EQ(hipMemcpy(res.rsum.data(), dRsum, scalar_size * sizeof(float),
                         hipMemcpyDeviceToHost), hipSuccess);
     hipFree(dSacc); hipFree(dP); hipFree(dRmax); hipFree(dRsum);
-    return res;
 }
 
 // Load golden dump_reg slot.
@@ -150,7 +149,8 @@ TEST(SoftmaxFullTile, MatchesCpuRef) {
     std::vector<float> s_acc(kQKOutElems);
     ref_qk_gemm(hQ.data(), D, sq, hK.data(), D, sk, s_acc.data());
 
-    auto res = run_kernel(s_acc, sk, /*kv_offset=*/0, scale_s);
+    SoftmaxResult res;
+    run_kernel(s_acc, sk, /*kv_offset=*/0, scale_s, res);
 
     std::vector<float> exp_p(256 * 32), exp_rmax(256), exp_rsum(256);
     ref_softmax(s_acc.data(), sk, 0, scale_s, exp_p.data(), exp_rmax.data(), exp_rsum.data());
@@ -169,7 +169,8 @@ TEST(SoftmaxFullTile, MatchesGolden) {
     std::vector<float> golden_sacc;
     ASSERT_TRUE(load_golden_slot(g_golden_full, /*slot=*/1, /*regs=*/32, golden_sacc));
 
-    auto res = run_kernel(golden_sacc, sk, 0, scale_s);
+    SoftmaxResult res;
+    run_kernel(golden_sacc, sk, 0, scale_s, res);
 
     // Compare P against golden slot 3
     std::vector<float> golden_p;
@@ -192,7 +193,8 @@ TEST(SoftmaxPartialTile, MatchesCpuRef) {
     std::vector<float> s_acc(kQKOutElems);
     ref_qk_gemm(hQ.data(), D, sq, hK.data(), D, sk, s_acc.data());
 
-    auto res = run_kernel(s_acc, sk, 0, scale_s);
+    SoftmaxResult res;
+    run_kernel(s_acc, sk, 0, scale_s, res);
 
     std::vector<float> exp_p(256 * 32), exp_rmax(256), exp_rsum(256);
     ref_softmax(s_acc.data(), sk, 0, scale_s, exp_p.data(), exp_rmax.data(), exp_rsum.data());
@@ -210,7 +212,8 @@ TEST(SoftmaxPartialTile, MatchesGolden) {
     std::vector<float> golden_sacc;
     ASSERT_TRUE(load_golden_slot(g_golden_partial, /*slot=*/1, /*regs=*/32, golden_sacc));
 
-    auto res = run_kernel(golden_sacc, sk, 0, scale_s);
+    SoftmaxResult res;
+    run_kernel(golden_sacc, sk, 0, scale_s, res);
 
     std::vector<float> golden_p;
     ASSERT_TRUE(load_golden_slot(g_golden_partial, /*slot=*/3, /*regs=*/32, golden_p));
@@ -228,7 +231,8 @@ TEST(SoftmaxEdge, MinTile) {
     auto hQ=make_Q(sq,D); auto hK=make_K(sk,D);
     std::vector<float> s_acc(kQKOutElems);
     ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,s_acc.data());
-    auto res=run_kernel(s_acc, sk, 0, scale_s);
+    SoftmaxResult res;
+    run_kernel(s_acc, sk, 0, scale_s, res);
     std::vector<float> exp_p(256*32), exp_rmax(256), exp_rsum(256);
     ref_softmax(s_acc.data(), sk, 0, scale_s, exp_p.data(), exp_rmax.data(), exp_rsum.data());
     compare_exact(res.p, exp_p, "edge/min/P");
@@ -240,7 +244,8 @@ TEST(SoftmaxEdge, FullM0) {
     auto hQ=make_Q(sq,D); auto hK=make_K(sk,D);
     std::vector<float> s_acc(kQKOutElems);
     ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,s_acc.data());
-    auto res=run_kernel(s_acc, sk, 0, scale_s);
+    SoftmaxResult res;
+    run_kernel(s_acc, sk, 0, scale_s, res);
     std::vector<float> exp_p(256*32), exp_rmax(256), exp_rsum(256);
     ref_softmax(s_acc.data(), sk, 0, scale_s, exp_p.data(), exp_rmax.data(), exp_rsum.data());
     compare_exact(res.p, exp_p, "edge/fullM0/P");
@@ -252,7 +257,8 @@ TEST(SoftmaxEdge, SingleKCol) {
     auto hQ=make_Q(sq,D); auto hK=make_K(sk,D);
     std::vector<float> s_acc(kQKOutElems);
     ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,s_acc.data());
-    auto res=run_kernel(s_acc, sk, 0, scale_s);
+    SoftmaxResult res;
+    run_kernel(s_acc, sk, 0, scale_s, res);
     std::vector<float> exp_p(256*32), exp_rmax(256), exp_rsum(256);
     ref_softmax(s_acc.data(), sk, 0, scale_s, exp_p.data(), exp_rmax.data(), exp_rsum.data());
     compare_exact(res.p, exp_p, "edge/singleK/P");

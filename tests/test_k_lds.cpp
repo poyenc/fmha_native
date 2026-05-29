@@ -27,31 +27,31 @@ std::vector<uint16_t> make_golden_K(int seqlen_k, int D) {
     return K;
 }
 
-// Run the kernel and return the dumped K LDS region (bf16, kKLdsRegionElems).
-std::vector<uint16_t> run_kernel(const std::vector<uint16_t>& h_K,
-                                 int stride_k, int kv_offset, int seqlen_k) {
+// Run the kernel, write result into `h_out`.
+void run_kernel(const std::vector<uint16_t>& h_K,
+                int stride_k, int kv_offset, int seqlen_k,
+                std::vector<uint16_t>& h_out) {
+    h_out.resize(kKLdsRegionElems);
     const size_t nbytes_k = h_K.size() * sizeof(uint16_t);
     void *d_K = nullptr, *d_out = nullptr;
-    EXPECT_EQ(hipMalloc(&d_K, nbytes_k), hipSuccess);
-    EXPECT_EQ(hipMalloc(&d_out, kKLdsRegionElems * sizeof(uint16_t)), hipSuccess);
-    EXPECT_EQ(hipMemcpy(d_K, h_K.data(), nbytes_k, hipMemcpyHostToDevice), hipSuccess);
-    EXPECT_EQ(hipMemset(d_out, 0, kKLdsRegionElems * sizeof(uint16_t)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_K, nbytes_k), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_out, kKLdsRegionElems * sizeof(uint16_t)), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_K, h_K.data(), nbytes_k, hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemset(d_out, 0, kKLdsRegionElems * sizeof(uint16_t)), hipSuccess);
 
     dim3 grid(1), block(256);
     hipLaunchKernelGGL(test_k_lds_kernel, grid, block, 0, nullptr,
                        reinterpret_cast<const uint16_t*>(d_K),
                        reinterpret_cast<uint16_t*>(d_out),
                        stride_k, kv_offset, seqlen_k);
-    EXPECT_EQ(hipGetLastError(), hipSuccess);
-    EXPECT_EQ(hipDeviceSynchronize(), hipSuccess);
+    ASSERT_EQ(hipGetLastError(), hipSuccess);
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 
-    std::vector<uint16_t> h_out(kKLdsRegionElems);
-    EXPECT_EQ(hipMemcpy(h_out.data(), d_out,
+    ASSERT_EQ(hipMemcpy(h_out.data(), d_out,
                         kKLdsRegionElems * sizeof(uint16_t),
                         hipMemcpyDeviceToHost), hipSuccess);
     hipFree(d_K);
     hipFree(d_out);
-    return h_out;
 }
 
 // Load golden dump_lds.bin slot 0 (K_LDS) as fp32 floats (>= 8192).
@@ -132,28 +132,32 @@ void check_vs_golden(const std::vector<uint16_t>& kern, int kv_offset, int seqle
 TEST(KLdsFullTile, MatchesCpuRef) {
     const int seqlen_k = 64, D = 64, stride_k = 64, kv_offset = 0;
     auto h_K = make_golden_K(seqlen_k, D);
-    auto kern = run_kernel(h_K, stride_k, kv_offset, seqlen_k);
+    std::vector<uint16_t> kern;
+    run_kernel(h_K, stride_k, kv_offset, seqlen_k, kern);
     check_vs_cpu_ref(kern, h_K, stride_k, kv_offset, seqlen_k);
 }
 
 TEST(KLdsFullTile, MatchesGolden) {
     const int seqlen_k = 64, D = 64, stride_k = 64, kv_offset = 0;
     auto h_K = make_golden_K(seqlen_k, D);
-    auto kern = run_kernel(h_K, stride_k, kv_offset, seqlen_k);
+    std::vector<uint16_t> kern;
+    run_kernel(h_K, stride_k, kv_offset, seqlen_k, kern);
     check_vs_golden(kern, kv_offset, seqlen_k, g_golden_full);
 }
 
 TEST(KLdsPartialTile, MatchesCpuRef) {
     const int seqlen_k = 33, D = 64, stride_k = 64, kv_offset = 0;
     auto h_K = make_golden_K(seqlen_k, D);
-    auto kern = run_kernel(h_K, stride_k, kv_offset, seqlen_k);
+    std::vector<uint16_t> kern;
+    run_kernel(h_K, stride_k, kv_offset, seqlen_k, kern);
     check_vs_cpu_ref(kern, h_K, stride_k, kv_offset, seqlen_k);
 }
 
 TEST(KLdsPartialTile, MatchesGolden) {
     const int seqlen_k = 33, D = 64, stride_k = 64, kv_offset = 0;
     auto h_K = make_golden_K(seqlen_k, D);
-    auto kern = run_kernel(h_K, stride_k, kv_offset, seqlen_k);
+    std::vector<uint16_t> kern;
+    run_kernel(h_K, stride_k, kv_offset, seqlen_k, kern);
     check_vs_golden(kern, kv_offset, seqlen_k, g_golden_partial);
 }
 
@@ -162,21 +166,24 @@ TEST(KLdsPartialTile, MatchesGolden) {
 TEST(KLdsEdge, MinTile) {
     const int seqlen_k = 1, D = 64, stride_k = 64, kv_offset = 0;
     auto h_K = make_golden_K(seqlen_k, D);
-    auto kern = run_kernel(h_K, stride_k, kv_offset, seqlen_k);
+    std::vector<uint16_t> kern;
+    run_kernel(h_K, stride_k, kv_offset, seqlen_k, kern);
     check_vs_cpu_ref(kern, h_K, stride_k, kv_offset, seqlen_k);
 }
 
 TEST(KLdsEdge, FullM0) {
     const int seqlen_k = 64, D = 64, stride_k = 64, kv_offset = 0;
     auto h_K = make_golden_K(seqlen_k, D);
-    auto kern = run_kernel(h_K, stride_k, kv_offset, seqlen_k);
+    std::vector<uint16_t> kern;
+    run_kernel(h_K, stride_k, kv_offset, seqlen_k, kern);
     check_vs_cpu_ref(kern, h_K, stride_k, kv_offset, seqlen_k);
 }
 
 TEST(KLdsEdge, SingleCol) {
     const int seqlen_k = 1, D = 64, stride_k = 64, kv_offset = 0;
     auto h_K = make_golden_K(seqlen_k, D);
-    auto kern = run_kernel(h_K, stride_k, kv_offset, seqlen_k);
+    std::vector<uint16_t> kern;
+    run_kernel(h_K, stride_k, kv_offset, seqlen_k, kern);
     check_vs_cpu_ref(kern, h_K, stride_k, kv_offset, seqlen_k);
 }
 

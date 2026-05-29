@@ -30,28 +30,28 @@ std::vector<uint16_t> make_K(int seqlen, int D) {
     return v;
 }
 
-std::vector<float> run_kernel(const std::vector<uint16_t>& hQ, int sq,
-                              const std::vector<uint16_t>& hK, int sk, int D) {
+void run_kernel(const std::vector<uint16_t>& hQ, int sq,
+                const std::vector<uint16_t>& hK, int sk, int D,
+                std::vector<float>& hOut) {
+    hOut.resize(kQKOutElems);
     void *dQ=nullptr, *dK=nullptr, *dOut=nullptr;
-    EXPECT_EQ(hipMalloc(&dQ, hQ.size()*2), hipSuccess);
-    EXPECT_EQ(hipMalloc(&dK, hK.size()*2), hipSuccess);
-    EXPECT_EQ(hipMalloc(&dOut, kQKOutElems*sizeof(float)), hipSuccess);
-    EXPECT_EQ(hipMemcpy(dQ, hQ.data(), hQ.size()*2, hipMemcpyHostToDevice), hipSuccess);
-    EXPECT_EQ(hipMemcpy(dK, hK.data(), hK.size()*2, hipMemcpyHostToDevice), hipSuccess);
-    EXPECT_EQ(hipMemset(dOut, 0, kQKOutElems*sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dQ, hQ.size()*2), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dK, hK.size()*2), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dOut, kQKOutElems*sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMemcpy(dQ, hQ.data(), hQ.size()*2, hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemcpy(dK, hK.data(), hK.size()*2, hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemset(dOut, 0, kQKOutElems*sizeof(float)), hipSuccess);
 
     hipLaunchKernelGGL(test_qk_gemm_kernel, dim3(1), dim3(256), 0, nullptr,
                        reinterpret_cast<const uint16_t*>(dQ),
                        reinterpret_cast<const uint16_t*>(dK),
                        reinterpret_cast<float*>(dOut),
                        /*stride_q=*/D, /*stride_k=*/D, sq, sk);
-    EXPECT_EQ(hipGetLastError(), hipSuccess);
-    EXPECT_EQ(hipDeviceSynchronize(), hipSuccess);
+    ASSERT_EQ(hipGetLastError(), hipSuccess);
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 
-    std::vector<float> hOut(kQKOutElems);
-    EXPECT_EQ(hipMemcpy(hOut.data(), dOut, kQKOutElems*sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
+    ASSERT_EQ(hipMemcpy(hOut.data(), dOut, kQKOutElems*sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
     hipFree(dQ); hipFree(dK); hipFree(dOut);
-    return hOut;
 }
 
 // Load golden dump_reg slot 1 (S_ACC): reg[(slot*256+tid)*64 + r], MAX_REGS=64.
@@ -108,7 +108,8 @@ void compare(const std::vector<float>& got, const std::vector<float>& exp,
 TEST(QkGemmFullTile, MatchesCpuRef) {
     const int sq=64, sk=64, D=64;
     auto hQ=make_Q(sq,D), hK=make_K(sk,D);
-    auto got=run_kernel(hQ,sq,hK,sk,D);
+    std::vector<float> got;
+    run_kernel(hQ,sq,hK,sk,D,got);
     std::vector<float> exp(kQKOutElems);
     ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,exp.data());
     compare(got, exp, "full/cpuref");
@@ -118,7 +119,8 @@ TEST(QkGemmFullTile, MatchesGolden) {
     if (g_golden_full.empty()) GTEST_SKIP() << "no --golden-full dir";
     const int sq=64, sk=64, D=64;
     auto hQ=make_Q(sq,D), hK=make_K(sk,D);
-    auto got=run_kernel(hQ,sq,hK,sk,D);
+    std::vector<float> got;
+    run_kernel(hQ,sq,hK,sk,D,got);
     std::vector<float> golden;
     ASSERT_TRUE(load_golden_sacc(g_golden_full, golden));
     compare(got, golden, "full/golden");
@@ -127,7 +129,8 @@ TEST(QkGemmFullTile, MatchesGolden) {
 TEST(QkGemmPartialTile, MatchesCpuRef) {
     const int sq=17, sk=33, D=64;
     auto hQ=make_Q(sq,D), hK=make_K(sk,D);
-    auto got=run_kernel(hQ,sq,hK,sk,D);
+    std::vector<float> got;
+    run_kernel(hQ,sq,hK,sk,D,got);
     std::vector<float> exp(kQKOutElems);
     ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,exp.data());
     compare(got, exp, "partial/cpuref");
@@ -137,7 +140,8 @@ TEST(QkGemmPartialTile, MatchesGolden) {
     if (g_golden_partial.empty()) GTEST_SKIP() << "no --golden-partial dir";
     const int sq=17, sk=33, D=64;
     auto hQ=make_Q(sq,D), hK=make_K(sk,D);
-    auto got=run_kernel(hQ,sq,hK,sk,D);
+    std::vector<float> got;
+    run_kernel(hQ,sq,hK,sk,D,got);
     std::vector<float> golden;
     ASSERT_TRUE(load_golden_sacc(g_golden_partial, golden));
     compare(got, golden, "partial/golden");
@@ -148,7 +152,8 @@ TEST(QkGemmPartialTile, MatchesGolden) {
 TEST(QkGemmEdge, MinTile) {
     const int sq=1, sk=1, D=64;
     auto hQ=make_Q(sq,D), hK=make_K(sk,D);
-    auto got=run_kernel(hQ,sq,hK,sk,D);
+    std::vector<float> got;
+    run_kernel(hQ,sq,hK,sk,D,got);
     std::vector<float> exp(kQKOutElems);
     ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,exp.data());
     compare(got, exp, "edge/min");
@@ -157,7 +162,8 @@ TEST(QkGemmEdge, MinTile) {
 TEST(QkGemmEdge, FullM0) {
     const int sq=128, sk=64, D=64;
     auto hQ=make_Q(sq,D), hK=make_K(sk,D);
-    auto got=run_kernel(hQ,sq,hK,sk,D);
+    std::vector<float> got;
+    run_kernel(hQ,sq,hK,sk,D,got);
     std::vector<float> exp(kQKOutElems);
     ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,exp.data());
     compare(got, exp, "edge/fullM0");
@@ -166,7 +172,8 @@ TEST(QkGemmEdge, FullM0) {
 TEST(QkGemmEdge, SingleKCol) {
     const int sq=64, sk=1, D=64;
     auto hQ=make_Q(sq,D), hK=make_K(sk,D);
-    auto got=run_kernel(hQ,sq,hK,sk,D);
+    std::vector<float> got;
+    run_kernel(hQ,sq,hK,sk,D,got);
     std::vector<float> exp(kQKOutElems);
     ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,exp.data());
     compare(got, exp, "edge/singleK");

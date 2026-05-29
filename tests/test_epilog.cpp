@@ -24,46 +24,45 @@ struct EpilogResult {
     std::vector<float> o_dram;   // seqlen_q*64 fp32 (bf16-promoted)
 };
 
-EpilogResult run_kernel(const std::vector<float>& o_acc,
-                        const std::vector<float>& rsum,
-                        int seqlen_q, int stride_o) {
+void run_kernel(const std::vector<float>& o_acc,
+                const std::vector<float>& rsum,
+                int seqlen_q, int stride_o,
+                EpilogResult& res) {
     const int n_final = 256 * 32;
     const int n_dram = seqlen_q * 64;
 
     void *dOacc = nullptr, *dRsum = nullptr, *dOdram = nullptr, *dOfinal = nullptr;
-    EXPECT_EQ(hipMalloc(&dOacc, o_acc.size() * sizeof(float)), hipSuccess);
-    EXPECT_EQ(hipMalloc(&dRsum, rsum.size() * sizeof(float)), hipSuccess);
-    EXPECT_EQ(hipMalloc(&dOdram, n_dram * sizeof(uint16_t)), hipSuccess);
-    EXPECT_EQ(hipMalloc(&dOfinal, n_final * sizeof(float)), hipSuccess);
-    EXPECT_EQ(hipMemcpy(dOacc, o_acc.data(), o_acc.size() * sizeof(float),
+    ASSERT_EQ(hipMalloc(&dOacc, o_acc.size() * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dRsum, rsum.size() * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dOdram, n_dram * sizeof(uint16_t)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dOfinal, n_final * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMemcpy(dOacc, o_acc.data(), o_acc.size() * sizeof(float),
                         hipMemcpyHostToDevice), hipSuccess);
-    EXPECT_EQ(hipMemcpy(dRsum, rsum.data(), rsum.size() * sizeof(float),
+    ASSERT_EQ(hipMemcpy(dRsum, rsum.data(), rsum.size() * sizeof(float),
                         hipMemcpyHostToDevice), hipSuccess);
-    EXPECT_EQ(hipMemset(dOdram, 0, n_dram * sizeof(uint16_t)), hipSuccess);
-    EXPECT_EQ(hipMemset(dOfinal, 0, n_final * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMemset(dOdram, 0, n_dram * sizeof(uint16_t)), hipSuccess);
+    ASSERT_EQ(hipMemset(dOfinal, 0, n_final * sizeof(float)), hipSuccess);
 
     hipLaunchKernelGGL(test_epilog_kernel, dim3(1), dim3(256), 0, nullptr,
                        (const float*)dOacc, (const float*)dRsum,
                        (uint16_t*)dOdram, (float*)dOfinal,
                        seqlen_q, stride_o);
-    EXPECT_EQ(hipGetLastError(), hipSuccess);
-    EXPECT_EQ(hipDeviceSynchronize(), hipSuccess);
+    ASSERT_EQ(hipGetLastError(), hipSuccess);
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 
-    EpilogResult res;
     res.o_final.resize(n_final);
-    EXPECT_EQ(hipMemcpy(res.o_final.data(), dOfinal, n_final * sizeof(float),
+    ASSERT_EQ(hipMemcpy(res.o_final.data(), dOfinal, n_final * sizeof(float),
                         hipMemcpyDeviceToHost), hipSuccess);
 
     // Read DRAM output as bf16, widen to fp32
     std::vector<uint16_t> dram_bf16(n_dram);
-    EXPECT_EQ(hipMemcpy(dram_bf16.data(), dOdram, n_dram * sizeof(uint16_t),
+    ASSERT_EQ(hipMemcpy(dram_bf16.data(), dOdram, n_dram * sizeof(uint16_t),
                         hipMemcpyDeviceToHost), hipSuccess);
     res.o_dram.resize(n_dram);
     for (int i = 0; i < n_dram; ++i)
         res.o_dram[i] = bf16_to_float(dram_bf16[i]);
 
     hipFree(dOacc); hipFree(dRsum); hipFree(dOdram); hipFree(dOfinal);
-    return res;
 }
 
 bool load_golden_slot(const std::string& dir, int slot, int regs,
@@ -198,7 +197,8 @@ TEST(EpilogFullTile, MatchesCpuRef) {
     const float scale_s = 0.125f;
     auto [o_acc, rsum] = compute_epilog_input(sq, sk, D, scale_s);
 
-    auto res = run_kernel(o_acc, rsum, sq, D);
+    EpilogResult res;
+    run_kernel(o_acc, rsum, sq, D, res);
 
     std::vector<float> exp_final(256 * 32), exp_dram(sq * D);
     ref_epilog(o_acc.data(), rsum.data(), sq, exp_final.data(), exp_dram.data());
@@ -218,7 +218,8 @@ TEST(EpilogFullTile, MatchesGolden) {
     ASSERT_TRUE(load_golden_slot(g_golden_full, 1, 32, sacc));
     auto rsum = compute_rsum_from_sacc(sacc, sk, scale_s);
 
-    auto res = run_kernel(o_acc, rsum, sq, D);
+    EpilogResult res;
+    run_kernel(o_acc, rsum, sq, D, res);
 
     // O_final vs golden slot 6
     std::vector<float> golden_ofinal;
@@ -236,7 +237,8 @@ TEST(EpilogPartialTile, MatchesCpuRef) {
     const float scale_s = 0.125f;
     auto [o_acc, rsum] = compute_epilog_input(sq, sk, D, scale_s);
 
-    auto res = run_kernel(o_acc, rsum, sq, D);
+    EpilogResult res;
+    run_kernel(o_acc, rsum, sq, D, res);
 
     std::vector<float> exp_final(256 * 32), exp_dram(sq * D);
     ref_epilog(o_acc.data(), rsum.data(), sq, exp_final.data(), exp_dram.data());
@@ -256,7 +258,8 @@ TEST(EpilogPartialTile, MatchesGolden) {
     ASSERT_TRUE(load_golden_slot(g_golden_partial, 1, 32, sacc));
     auto rsum = compute_rsum_from_sacc(sacc, sk, scale_s);
 
-    auto res = run_kernel(o_acc, rsum, sq, D);
+    EpilogResult res;
+    run_kernel(o_acc, rsum, sq, D, res);
 
     std::vector<float> golden_ofinal;
     ASSERT_TRUE(load_golden_slot(g_golden_partial, 6, 32, golden_ofinal));
@@ -272,7 +275,8 @@ TEST(EpilogPartialTile, MatchesGolden) {
 TEST(EpilogEdge, MinTile) {
     const int sq=1, sk=1, D=64; const float scale_s=0.125f;
     auto [o_acc, rsum] = compute_epilog_input(sq, sk, D, scale_s);
-    auto res = run_kernel(o_acc, rsum, sq, D);
+    EpilogResult res;
+    run_kernel(o_acc, rsum, sq, D, res);
     std::vector<float> exp_final(256*32), exp_dram(sq*D);
     ref_epilog(o_acc.data(), rsum.data(), sq, exp_final.data(), exp_dram.data());
     compare_tolerance(res.o_final, exp_final, "edge/min/o_final");
@@ -282,7 +286,8 @@ TEST(EpilogEdge, MinTile) {
 TEST(EpilogEdge, FullM0) {
     const int sq=128, sk=64, D=64; const float scale_s=0.125f;
     auto [o_acc, rsum] = compute_epilog_input(sq, sk, D, scale_s);
-    auto res = run_kernel(o_acc, rsum, sq, D);
+    EpilogResult res;
+    run_kernel(o_acc, rsum, sq, D, res);
     std::vector<float> exp_final(256*32), exp_dram(sq*D);
     ref_epilog(o_acc.data(), rsum.data(), sq, exp_final.data(), exp_dram.data());
     compare_tolerance(res.o_final, exp_final, "edge/fullM0/o_final");
@@ -292,7 +297,8 @@ TEST(EpilogEdge, FullM0) {
 TEST(EpilogEdge, SingleKCol) {
     const int sq=64, sk=1, D=64; const float scale_s=0.125f;
     auto [o_acc, rsum] = compute_epilog_input(sq, sk, D, scale_s);
-    auto res = run_kernel(o_acc, rsum, sq, D);
+    EpilogResult res;
+    run_kernel(o_acc, rsum, sq, D, res);
     std::vector<float> exp_final(256*32), exp_dram(sq*D);
     ref_epilog(o_acc.data(), rsum.data(), sq, exp_final.data(), exp_dram.data());
     compare_tolerance(res.o_final, exp_final, "edge/singleK/o_final");

@@ -634,3 +634,145 @@ TEST_P(FmhaFwdD64Test, MatchesGpuRef) {
 INSTANTIATE_TEST_SUITE_P(Full, FmhaFwdD64Test,
     ::testing::ValuesIn(kAllFull),
     [](const auto& info) { return info.param.name; });
+
+// ---------- Golden bit-match test: fused kernel vs CK o_dram.bin ----------
+//
+// Loads golden o_dram.bin (CK kernel output, fp32 bf16-promoted) and compares
+// against the fused kernel's bf16 O output.  Inputs are generated from the
+// same deterministic formulas used by the CK golden dump:
+//   Q[i] = (i % 256) / 256.0;  K[i] = ((i + 64) % 256) / 256.0;
+//   V[i] = (i % 256) / 256.0 + 1.0;
+// B=1, H=1, D=64, no mask, scale=0.125 (= 1/sqrt(64)).
+//
+// Two tile sizes: full (sq=64, sk=64) and partial (sq=17, sk=33).
+// Acceptance: 0 bf16 mismatches vs CK golden O.
+
+namespace {
+
+bool load_golden_o_dram(const char* path, std::vector<float>& out) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long bytes = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    out.resize(bytes / sizeof(float));
+    size_t got = fread(out.data(), sizeof(float), out.size(), f);
+    fclose(f);
+    return got == out.size();
+}
+
+void run_golden_test(int sq, int sk, const char* golden_path) {
+    constexpr int B = 1, H = 1, D = 64;
+    constexpr float kLog2e = 1.4426950408889634f;
+    constexpr float scale_s = 0.125f;  // 1/sqrt(64)
+
+    // Generate deterministic Q/K/V matching CK golden dump formulas
+    const size_t n_q = (size_t)sq * D;
+    const size_t n_k = (size_t)sk * D;
+    const size_t n_v = (size_t)sk * D;
+    const size_t n_o = (size_t)sq * D;
+
+    std::vector<uint16_t> h_Q(n_q), h_K(n_k), h_V(n_v);
+    for (size_t i = 0; i < n_q; i++) h_Q[i] = float_to_bf16((i % 256) / 256.0f);
+    for (size_t i = 0; i < n_k; i++) h_K[i] = float_to_bf16(((i + 64) % 256) / 256.0f);
+    for (size_t i = 0; i < n_v; i++) h_V[i] = float_to_bf16((i % 256) / 256.0f + 1.0f);
+
+    // Allocate device memory
+    void *d_Q = nullptr, *d_K = nullptr, *d_V = nullptr, *d_O = nullptr;
+    ASSERT_EQ(hipMalloc(&d_Q, n_q * 2), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_K, n_k * 2), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_V, n_v * 2), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_O, n_o * 2), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_Q, h_Q.data(), n_q * 2, hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_K, h_K.data(), n_k * 2, hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_V, h_V.data(), n_v * 2, hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemset(d_O, 0, n_o * 2), hipSuccess);
+
+    // Build kernel params
+    FmhaFwdParams kparams{};
+    kparams.q = reinterpret_cast<const __hip_bfloat16*>(d_Q);
+    kparams.k = reinterpret_cast<const __hip_bfloat16*>(d_K);
+    kparams.v = reinterpret_cast<const __hip_bfloat16*>(d_V);
+    kparams.o = reinterpret_cast<__hip_bfloat16*>(d_O);
+    kparams.lse = nullptr;
+    kparams.seqlen_q = sq;
+    kparams.seqlen_k = sk;
+    kparams.nhead_q = H;
+    kparams.nhead_k = H;
+    kparams.scale = kLog2e * scale_s;
+    kparams.stride_q       = D;
+    kparams.stride_k       = D;
+    kparams.stride_v       = D;
+    kparams.stride_o       = D;
+    kparams.nhead_stride_q = sq * D;
+    kparams.nhead_stride_k = sk * D;
+    kparams.nhead_stride_v = sk * D;
+    kparams.nhead_stride_o = sq * D;
+    kparams.batch_stride_q = H * sq * D;
+    kparams.batch_stride_k = H * sk * D;
+    kparams.batch_stride_v = H * sk * D;
+    kparams.batch_stride_o = H * sq * D;
+    kparams.seqstart_q = nullptr;
+    kparams.seqstart_k = nullptr;
+
+    // Launch fused kernel (no mask)
+    const int m_tiles = (sq + kM0 - 1) / kM0;
+    dim3 grid(H, m_tiles, B);
+    dim3 block(kBlockSize);
+    hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk0, grid, block, 0, nullptr, kparams);
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+    // Read kernel O as bf16, promote to fp32
+    std::vector<uint16_t> h_O_bf16(n_o);
+    ASSERT_EQ(hipMemcpy(h_O_bf16.data(), d_O, n_o * 2, hipMemcpyDeviceToHost), hipSuccess);
+
+    // Load golden o_dram.bin (fp32, bf16-promoted)
+    std::vector<float> golden;
+    ASSERT_TRUE(load_golden_o_dram(golden_path, golden))
+        << "Cannot open golden file: " << golden_path;
+
+    ASSERT_EQ(golden.size(), n_o)
+        << "Golden size " << golden.size() << " != expected " << n_o;
+
+    // Compare: convert both to bf16 and check bit-exact match
+    int mismatches = 0;
+    float max_abs = 0;
+    for (size_t i = 0; i < n_o; i++) {
+        uint16_t kern_bf16 = h_O_bf16[i];
+        uint16_t gold_bf16 = float_to_bf16(golden[i]);
+
+        if (kern_bf16 != gold_bf16) {
+            float kern_f = bf16_to_float(kern_bf16);
+            float gold_f = bf16_to_float(gold_bf16);
+            float abs_err = fabsf(kern_f - gold_f);
+            if (abs_err > max_abs) max_abs = abs_err;
+            if (mismatches < 10) {
+                int row = (int)(i / D), col = (int)(i % D);
+                fprintf(stderr, "  mismatch [q=%d,d=%d]: kernel=%04x (%.6f) golden=%04x (%.6f) err=%.6f\n",
+                        row, col, kern_bf16, kern_f, gold_bf16, gold_f, abs_err);
+            }
+            mismatches++;
+        }
+    }
+
+    fprintf(stderr, "\n=== CK Golden bit-match: sq=%d sk=%d ===\n", sq, sk);
+    fprintf(stderr, "bf16 mismatches: %d / %zu\n", mismatches, n_o);
+    if (mismatches > 0) fprintf(stderr, "max abs err: %.6f\n", max_abs);
+
+    EXPECT_EQ(mismatches, 0)
+        << "bf16 mismatches vs CK golden: " << mismatches << "/" << n_o;
+
+    hipFree(d_Q); hipFree(d_K); hipFree(d_V); hipFree(d_O);
+}
+
+} // namespace
+
+TEST(FmhaGoldenCK, FullTile) {
+    run_golden_test(64, 64,
+        "/tmp/fmha-native-isa-match/golden/full/o_dram.bin");
+}
+
+TEST(FmhaGoldenCK, PartialTile) {
+    run_golden_test(17, 33,
+        "/tmp/fmha-native-isa-match/golden/partial/o_dram.bin");
+}

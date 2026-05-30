@@ -6,39 +6,27 @@
 #include "fmha_fwd_d64_softmax.hpp"
 #include "fmha_fwd_d64_epilog.hpp"
 
-// Build an __amdgpu_buffer_rsrc_t from a pre-offset base pointer.
 __device__ __forceinline__ __amdgpu_buffer_rsrc_t make_buffer_resource(const void* base) {
     return __builtin_amdgcn_make_buffer_rsrc(
         const_cast<void*>(base), 0, 0xFFFFFFFF, 0x00027000);
 }
 
-// FMHA forward D64 device function.
-//
-// Full FA v2 pipeline: multi-tile K/V loop with online softmax.
-// For each K/V tile:
-//   1. Copy K to LDS
-//   2. GEMM0: S = Q * K^T
-//   3. Online softmax update (rescale O_acc, compute P)
-//   4. GEMM1: O_acc += P * V (bpermute-based, correctness first)
-// Epilog: O = O_acc / row_sum, cast to bf16, store to DRAM.
+constexpr int LdsSeq[4] = {1, 2, 1, 0};
+
 template <bool HasMask, bool IsVarlen>
 __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
                                     char* lds,
                                     int batch_idx,
                                     int head_idx,
                                     int m_tile_idx) {
-    const int lane_id = threadIdx.x % kWarpSize;
-    const int warp_id = threadIdx.x / kWarpSize;
+    const int lane_id = threadIdx.x & 63;
+    const int warp_id = threadIdx.x >> 6;
+    const int k_sub   = lane_id >> 5;
+    const int m_row   = (lane_id & 31) + 32 * warp_id;
 
-    // M-dimension mapping (Q rows)
-    const int m_local = warp_id * 32 + (lane_id & 31);
-    const int m_row   = m_tile_idx * kM0 + m_local;
-
-    // GQA head mapping
     const int nhead_ratio = params.nhead_q / params.nhead_k;
     const int kv_head_idx = head_idx / nhead_ratio;
 
-    // ---- Per-sequence lengths and offsets (varlen) ----
     int seqlen_q, seqlen_k;
     int offset_q = 0, offset_k = 0;
     if constexpr (IsVarlen) {
@@ -52,7 +40,6 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
         seqlen_k = params.seqlen_k;
     }
 
-    // ---- Base pointers ----
     const __hip_bfloat16* q_base;
     const __hip_bfloat16* k_base;
     const __hip_bfloat16* v_base;
@@ -77,163 +64,175 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
                            + static_cast<int64_t>(head_idx)  * params.nhead_stride_o;
     }
 
-    // ---- Build SRDs ----
     auto srd_q = make_buffer_resource(q_base);
     auto srd_k = make_buffer_resource(k_base);
     auto srd_v = make_buffer_resource(v_base);
     auto srd_o = make_buffer_resource(o_base);
 
-    // ---- Load Q: 8 x buffer_load_b128 = 64 bf16 per thread ----
-    const int q_row_bytes = m_row * (params.stride_q * 2);
+    int seqlen_k_start = 0;
+    int seqlen_k_end   = seqlen_k;
+    int mask_shift = seqlen_k - seqlen_q;
 
-    v4i q_regs[8];
-    if (m_row < seqlen_q) {
-        for (int i = 0; i < 8; i++) {
-            q_regs[i] = __builtin_amdgcn_raw_buffer_load_b128(
-                srd_q, q_row_bytes + i * 16, 0, 0);
+    if constexpr (HasMask) {
+        int last_q_row = m_tile_idx * kM0 + kM0 - 1;
+        if (last_q_row >= seqlen_q) last_q_row = seqlen_q - 1;
+        int raw_end = last_q_row + mask_shift + 1;
+        if (raw_end > seqlen_k) raw_end = seqlen_k;
+        seqlen_k_end = ((raw_end + kN0 - 1) / kN0) * kN0;
+        if (seqlen_k_end > seqlen_k) seqlen_k_end = seqlen_k;
+        seqlen_k_start = 0;
+    }
+
+    int num_total_loop = (seqlen_k_end - seqlen_k_start + kN0 - 1) / kN0;
+
+    v16f o_acc_d0, o_acc_d1;
+    clear_acc(o_acc_d0);
+    clear_acc(o_acc_d1);
+
+    if (num_total_loop <= 0) {
+        float* lse_base = nullptr;
+        if (params.lse) {
+            if constexpr (IsVarlen) {
+                int nhead_stride_lse = params.nhead_stride_q / params.stride_q;
+                lse_base = params.lse + static_cast<int64_t>(head_idx) * nhead_stride_lse + offset_q;
+            } else {
+                lse_base = params.lse
+                    + static_cast<int64_t>(batch_idx) * (params.nhead_q * params.seqlen_q)
+                    + static_cast<int64_t>(head_idx) * params.seqlen_q;
+            }
+        }
+        epilog_store(o_acc_d0, o_acc_d1, 0.0f, -INFINITY, srd_o,
+                     params.stride_o, lse_base, seqlen_q, m_tile_idx, o_base);
+        return;
+    }
+
+    const int abs_m_row = m_tile_idx * kM0 + m_row;
+    const int q_stride_bytes = params.stride_q * 2;
+
+    v4i q_regs[4];
+    if (abs_m_row < seqlen_q) {
+        #pragma unroll
+        for (int kstep = 0; kstep < 4; ++kstep) {
+            int hd = kstep * 16 + k_sub * 8;
+            int voff = abs_m_row * q_stride_bytes + hd * 2;
+            q_regs[kstep] = __builtin_amdgcn_raw_buffer_load_b128(srd_q, voff, 0, 0);
         }
     } else {
-        for (int i = 0; i < 8; i++) {
-            q_regs[i] = v4i{0, 0, 0, 0};
-        }
+        #pragma unroll
+        for (int kstep = 0; kstep < 4; ++kstep)
+            q_regs[kstep] = v4i{0, 0, 0, 0};
     }
 
-    __builtin_amdgcn_sched_barrier(0);  // Phase 1: Q load complete
+    float rmax = -INFINITY;
+    float rsum = 0.0f;
 
-    // ---- Initialize online softmax state ----
-    float rmax[16], rsum[16];
-    for (int i = 0; i < 16; i++) {
-        rmax[i] = -INFINITY;
-        rsum[i] = 0.0f;
-    }
-    v16f o_acc_n0 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-    v16f o_acc_n1 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    int kv_offset = seqlen_k_start;
+    int k_col_offset = 0;
 
-    // ---- LDS buffer offsets ----
-    const int lds_buf0_bytes = 0;
-    const int lds_buf1_bytes = kSingleSmemElements * 2; // 4608 bytes
+    // PROLOGUE
+    async_copy_k_subtile(lds, srd_k, params.stride_k, kv_offset, k_col_offset, LdsSeq[0]);
+    k_col_offset += kK0;
 
-    const int num_kv_tiles = (seqlen_k + kN0 - 1) / kN0;
+    // TILE LOOP
+    int i_total_loops = 0;
+    do {
+        // GEMM0
+        v16f s_acc_n0, s_acc_n1;
+        clear_acc(s_acc_n0);
+        clear_acc(s_acc_n1);
 
-    // ---- Main K/V tile loop ----
-    for (int kv_tile = 0; kv_tile < num_kv_tiles; kv_tile++) {
-        int kv_offset = kv_tile * kN0;
-
-        // Tile-level causal skip: if every element in this K/V tile
-        // is above the causal diagonal for all Q rows in this workgroup,
-        // skip the entire tile.
-        if constexpr (HasMask) {
-            int last_q_row = m_tile_idx * kM0 + kM0 - 1;
-            if (last_q_row >= seqlen_q)
-                last_q_row = seqlen_q - 1;
-            int shift = seqlen_k - seqlen_q;
-            if (kv_offset > last_q_row + shift) continue;
-        }
-
-        // ---- Phase: K copy to LDS ----
-        copy_k_to_lds_2x_guarded(srd_k, params.stride_k, lds,
-                                  lds_buf0_bytes, lds_buf1_bytes,
-                                  kv_offset, seqlen_k);
-        s_waitcnt_lgkmcnt_0();
-        s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
-
-        // ---- s_acc scope: GEMM0 → scale/mask → softmax → V → GEMM1 ----
         {
-            v16f s_acc_n0 = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
-            v16f s_acc_n1 = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+            async_copy_k_subtile(lds, srd_k, params.stride_k, kv_offset, k_col_offset, LdsSeq[1]);
+            k_col_offset += kK0;
+            async_copy_fence();
+            s_barrier();
+            gemm0_subtile(s_acc_n0, s_acc_n1, slice_q(q_regs, 0), lds, LdsSeq[0]);
+        }
 
-            // ---- Phase: GEMM0 ----
-            gemm0(s_acc_n0, s_acc_n1, q_regs, lds,
-                  lds_buf0_bytes, lds_buf1_bytes, lane_id);
+        {
+            async_copy_fence();
+            s_barrier();
+            v2i v_k3_0, v_k3_1;
+            load_v_from_dram(v_k3_0, v_k3_1, srd_v, params.stride_v, kv_offset);
+            gemm0_subtile(s_acc_n0, s_acc_n1, slice_q(q_regs, 1), lds, LdsSeq[1]);
+
             __builtin_amdgcn_sched_barrier(0);
 
-            // ---- Phase: Scale + mask ----
-            #pragma unroll
-            for (int i = 0; i < 16; i++) {
-                s_acc_n0[i] *= params.scale;
-                s_acc_n1[i] *= params.scale;
+            // V staging
+            s_waitcnt_vmcnt_0();
+            store_v_to_lds(v_k3_0, v_k3_1, lds, LdsSeq[2]);
+            v2i v1_k3_0, v1_k3_1;
+            load_v_from_dram(v1_k3_0, v1_k3_1, srd_v, params.stride_v, kv_offset + 32);
+            s_waitcnt_vmcnt_0();
+
+            // Softmax
+            float scale_s_log2e = params.scale;
+            softmax_scale_and_mask<HasMask>(s_acc_n0, s_acc_n1, scale_s_log2e,
+                                            seqlen_k, kv_offset, abs_m_row, mask_shift);
+            float m_new = softmax_row_max(s_acc_n0, s_acc_n1);
+            if (m_new == -INFINITY) m_new = rmax;
+            softmax_exp2(s_acc_n0, s_acc_n1, m_new);
+            float l_new = softmax_row_sum(s_acc_n0, s_acc_n1);
+
+            if (i_total_loops > 0) {
+                if (rmax != m_new) {
+                    rescale_o_acc(o_acc_d0, o_acc_d1, rmax, m_new);
+                    rsum = __builtin_amdgcn_exp2f(rmax - m_new) * rsum + l_new;
+                } else {
+                    rsum += l_new;
+                }
+            } else {
+                rsum = l_new;
             }
+            rmax = m_new;
+
+            softmax_p_to_bf16(s_acc_n0, s_acc_n1);
+
+            // GEMM1
+            v4h p_packed_0[4];
+            pack_p_subtile(p_packed_0, s_acc_n0);
+
             {
-                int n_pos = lane_id & 31;
-                int seqk_n0 = kv_offset + n_pos;
-                int seqk_n1 = kv_offset + 32 + n_pos;
-                if (seqk_n0 >= seqlen_k) {
-                    #pragma unroll
-                    for (int i = 0; i < 16; i++) s_acc_n0[i] = -INFINITY;
-                }
-                if (seqk_n1 >= seqlen_k) {
-                    #pragma unroll
-                    for (int i = 0; i < 16; i++) s_acc_n1[i] = -INFINITY;
-                }
-            }
-            if constexpr (HasMask) {
-                int k_sub = lane_id >> 5;
-                int n_pos = lane_id & 31;
-                int n_n0  = kv_offset + n_pos;
-                int n_n1  = kv_offset + 32 + n_pos;
-                int shift = seqlen_k - seqlen_q;
-                for (int i = 0; i < 16; i++) {
-                    int m_idx = m_tile_idx * kM0 + warp_id * 32 + k_sub * 16 + i;
-                    if (n_n0 > m_idx + shift) s_acc_n0[i] = -INFINITY;
-                    if (n_n1 > m_idx + shift) s_acc_n1[i] = -INFINITY;
-                }
+                s_barrier();
+                gemm1_subtile(o_acc_d0, o_acc_d1, p_packed_0, lds, LdsSeq[2]);
+                s_waitcnt_vmcnt_0();
+                store_v_to_lds(v1_k3_0, v1_k3_1, lds, LdsSeq[3]);
             }
 
-            // ---- Phase: Softmax ----
+            i_total_loops++;
+            if (i_total_loops < num_total_loop) {
+                kv_offset += kN0;
+                k_col_offset = 0;
+                s_barrier();
+                async_copy_k_subtile(lds, srd_k, params.stride_k, kv_offset, k_col_offset, LdsSeq[0]);
+                k_col_offset += kK0;
+            }
+
             {
-                float new_max[16];
-                softmax_row_max(new_max, s_acc_n0, s_acc_n1, lane_id);
-                // Merge new_max with rmax: keep rmax when new tile is fully
-                // masked (-INFINITY), preventing exp2f(finite - (-INF)) = INF
-                // from destroying accumulated o_acc and rsum.
-                for (int i = 0; i < 16; i++) {
-                    if (new_max[i] == -INFINITY)
-                        new_max[i] = rmax[i];
-                }
-                if (kv_tile > 0) {
-                    rescale_o_acc(o_acc_n0, o_acc_n1, rmax, new_max);
-                    for (int i = 0; i < 16; i++)
-                        rsum[i] *= __builtin_amdgcn_exp2f(rmax[i] - new_max[i]);
-                }
-                softmax_exp(s_acc_n0, s_acc_n1, new_max);
-                float new_sum[16];
-                softmax_row_sum(new_sum, s_acc_n0, s_acc_n1, lane_id);
-                for (int i = 0; i < 16; i++)
-                    rsum[i] += new_sum[i];
-                for (int i = 0; i < 16; i++)
-                    rmax[i] = new_max[i];
-            } // new_max, new_sum dead
-            __builtin_amdgcn_sched_barrier(0);
+                v4h p_packed_1[4];
+                pack_p_subtile(p_packed_1, s_acc_n1);
+                s_barrier();
+                gemm1_subtile(o_acc_d0, o_acc_d1, p_packed_1, lds, LdsSeq[3]);
+            }
 
-            // ---- GEMM1: O_acc += P * V (bpermute-based) ----
-            gemm1_bpermute(o_acc_n0, o_acc_n1, s_acc_n0, s_acc_n1,
-                           v_base, params.stride_v, kv_offset, seqlen_k,
-                           lane_id);
-        } // s_acc_n0, s_acc_n1 DEAD
-        __builtin_amdgcn_sched_barrier(0);
 
-        // Barrier before next iteration's K copy
-        s_barrier();
-    }
+        }
 
-    // ---- Epilog: normalize O by row_sum, cast to bf16, store ----
-    constexpr float kLog2e = 1.4426950408889634f;
+    } while (i_total_loops < num_total_loop);
+
+    // EPILOGUE
     float* lse_base = nullptr;
     if (params.lse) {
         if constexpr (IsVarlen) {
-            // LSE layout: [H, total_tokens] — nhead_stride_q / stride_q = total_tokens
             int nhead_stride_lse = params.nhead_stride_q / params.stride_q;
-            lse_base = params.lse
-                + static_cast<int64_t>(head_idx) * nhead_stride_lse
-                + offset_q;
+            lse_base = params.lse + static_cast<int64_t>(head_idx) * nhead_stride_lse + offset_q;
         } else {
             lse_base = params.lse
                 + static_cast<int64_t>(batch_idx) * (params.nhead_q * params.seqlen_q)
                 + static_cast<int64_t>(head_idx) * params.seqlen_q;
         }
     }
-    epilog_store_o(o_acc_n0, o_acc_n1, rsum, rmax, o_base, params.stride_o,
-                   lse_base, kLog2e,
-                   seqlen_q, m_tile_idx, warp_id, lane_id);
+
+    epilog_store(o_acc_d0, o_acc_d1, rsum, rmax, srd_o,
+                 params.stride_o, lse_base, seqlen_q, m_tile_idx, o_base);
 }

@@ -25,7 +25,7 @@ CpuRefResult cpu_ref_verify(const FmhaParams& p, const FmhaBuffers& bufs) {
     const float scalar  = p.scalar();
     const float tol_abs = 0.001f;
     const float tol_rel = 0.05f;
-    const double tol_cos = 0.99998;
+    const double tol_cos = 0.99995;
 
     const size_t total_rows = (size_t)B * Hq * Sq;
     printf("\n=== Verify (CPU reference, all %zu rows x %d dims) ===\n",

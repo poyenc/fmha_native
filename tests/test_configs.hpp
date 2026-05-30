@@ -65,5 +65,15 @@ inline const std::vector<TestCase> kAllFull = {
     {"D64AsymLongContext", 1, 4, 64, 64, 0, 4096, 1, 1, 0},
     {"D64VarlenTinyMaskLse", 4, 2, 512, 64, 0, 0, 1, 1, 0, {1, 512, 32, 256}},
     {"D64B8Mask", 8, 4, 512, 64, 0, 0, 1, 0, 0},
+    // === D64 Tile Boundary ===
+    {"D64EdgeS128", 1, 2, 128, 64, 0, 0, 0, 0, 0},
+    {"D64EdgeS128MaskLse", 1, 4, 128, 64, 0, 0, 1, 1, 0},
+    {"D64EdgeS65MaskLse", 1, 2, 65, 64, 0, 0, 1, 1, 0},
+    {"D64EdgeAsymS128Sk65Mask", 1, 2, 128, 64, 0, 65, 1, 0, 0},
+    // === D64 Feature Combos (gaps) ===
+    {"D64GqaLseNomask", 2, 8, 512, 64, 2, 0, 0, 1, 0},
+    {"D64VarlenGqaMaskLse", 2, 8, 512, 64, 2, 0, 1, 1, 0, {512, 256}},
+    {"D64VarlenLseNomask", 2, 4, 512, 64, 0, 0, 0, 1, 0, {512, 256}},
+    {"D64VarlenAsymMask", 2, 4, 256, 64, 0, 512, 1, 0, 0, {256, 128}},
 };
 // clang-format on

@@ -3,23 +3,16 @@ template: hip-kernel-team
 version: "2.0"
 name: fmha-native-isa-match
 created: 2026-05-28
-updated: 2026-05-29
+updated: 2026-05-30
 ---
 
 # Team: fmha-native-isa-match
 
 ## Goal
 
-**Primary (must achieve):** Pass 50/50 correctness tests + 48/48 GPU
-ref tests using CK-matched data layouts verified by golden dumps.
-
-**Secondary (target):** Match CK's ISA — VGPR ≤ 127, AGPR = 0, 0
-spills, 0 function calls, 32 MFMA.
-
-**Stretch:** Performance within ±2% TFLOPS of CK.
-
-Design spec: `docs/superpowers/specs/2026-05-29-fmha-native-d64-design.md`
-Plan: `docs/superpowers/plans/2026-05-29-fmha-native-d64.md`
+See the current spec and plan in `docs/superpowers/specs/` and
+`docs/superpowers/plans/`. This config defines HOW the team operates,
+not WHAT it builds.
 
 ## Roles
 
@@ -136,8 +129,9 @@ escalate to the user with:
 Gate failures include:
 - CPU ref mismatch beyond tolerance
 - Golden data mismatch (bit-exact fail)
-- Assembly checklist violation (wrong instruction type, scratch spill)
-- Integration test regression
+- ISA structural divergence (CFG or dependency chain mismatch)
+- Test regression (any previously-passing test now fails)
+- Spec compliance failure (independent reviewer reports NON-COMPLIANT)
 
 ### Iteration budget
 
@@ -147,6 +141,46 @@ Gate failures include:
 | CPU ref test fail | 3 | debug escalates to lead |
 | Golden data test fail | 2 | debug escalates to lead (golden may be wrong) |
 | Assembly gate fail | 0 | lead escalates to user immediately |
+
+## Quality Gate
+
+All members MUST read and follow the quality gate in the current plan
+(`docs/superpowers/plans/` — the most recent plan file). The gate is
+identical at every task: G0→G1→G2→G3→G4→G5.
+
+**G0 is every member's responsibility, not just lead's.** Before acting
+on a formula, file path, golden data, or teammate's claim — verify it
+against the actual artifact. Trust the file on disk, not the message.
+
+### Two-Layer Verification
+
+**Layer 1 — Teammate self-verification (mandatory):**
+Every teammate, after completing a task and reviewing their own output,
+MUST spawn a fresh subagent (1M context) to independently verify their
+deliverable. The subagent reads the spec, reads the actual output files,
+and reports PASS/FAIL with evidence. The teammate includes the
+subagent's verdict in their report to lead. Teammates who report "done"
+without a self-verification subagent verdict will have the task
+rejected.
+
+**Layer 2 — Lead verification (mandatory):**
+The lead NEVER trusts a teammate's claim — including the self-
+verification verdict. For every completed task, the lead spawns a
+SEPARATE fresh subagent (1M context) to independently verify the
+deliverable against the spec and plan. If the subagent cannot give a
+specific, evidence-backed reason to pass the gate (e.g., "looks correct"
+without citing file:line), the lead reads the artifacts directly and
+makes the judgment. Vague subagent verdicts are treated as FAIL.
+
+### What "verify" means
+
+Not "read the summary and agree." Verify means:
+- Subagent reads the ACTUAL file on disk (not a teammate's description)
+- Subagent checks formulas against the spec (re-derives, not pattern-matches)
+- Subagent runs grep to confirm claimed changes exist / old code is gone
+- Subagent cites specific file:line for every claim in its verdict
+- If the subagent says PASS, it must say WHY with evidence
+- If the subagent says FAIL, it must say WHAT is wrong with evidence
 
 ## Environment
 
@@ -391,6 +425,52 @@ bulk.
 - When a subagent returns, save its distilled finding to your output
   file; do not paste large excerpts back into your own context
 - Parallelize independent reads across multiple subagents in one batch
+
+## Verification Enforcement
+
+Every implementation deliverable MUST be independently verified before
+being marked done. "Impl says it's done" is NOT verification.
+
+### Mandatory verification steps (no exceptions)
+
+1. **Lead QA gate (per kernel):** Lead spawns a fresh subagent or runs
+   the test binary independently. Clean rebuild from scratch, both
+   golden dirs, no filters. Every test must PASS (exit 0). If impl
+   claims a fix was applied, lead MUST grep/read the actual file to
+   confirm — never trust the claim alone.
+
+2. **Spec compliance review (per phase):** Spawn independent subagent(s)
+   with 1M context to read the spec/plan and verify each kernel's code
+   matches. The reviewer has NO prior context — they verify from source.
+
+3. **ISA pattern review (per phase):** Prof or independent subagent
+   extracts assembly and verifies instruction types/counts match CK's
+   design patterns. Golden correctness alone is insufficient — the
+   implementation must use the right ISA patterns.
+
+4. **Documentation audit (per phase):** Before committing, spawn an
+   independent subagent to verify that knowledge.md, status.md, and
+   team config accurately reflect the actual state of code, tests, and
+   git history. Flag stale claims, wrong paths, and unimplemented fixes.
+
+### How to verify a claimed fix
+
+When a member reports "fix applied":
+```bash
+# 1. Check the actual file — don't trust the message
+grep -rn "<pattern>" <file>
+# 2. If the fix should have removed something, verify it's gone
+grep -rn "<old_pattern>" <file>  # should return nothing
+# 3. Rebuild and run tests to confirm no regression
+```
+
+### What happens when verification catches a lie
+
+If an independent audit finds that a claimed fix was NOT applied:
+1. The member is notified with the specific evidence
+2. The fix is re-assigned with explicit verification grep command
+3. Lead verifies the grep output before marking done
+4. The incident is logged in knowledge.md as a process finding
 
 ## Constraints
 

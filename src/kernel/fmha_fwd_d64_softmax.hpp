@@ -38,27 +38,36 @@ __device__ __forceinline__ void softmax_scale_and_mask(
 {
     const int k_sub = (threadIdx.x & 63) >> 5;
 
+    // Compute comparison thresholds once, then compare against per-register
+    // column offsets using inline adds.  This avoids the compiler hoisting
+    // 14 pre-computed column-index VGPRs across the tile loop (CK pattern:
+    // single base + immediate per comparison).
+    const int col_base = kv_offset + k_sub * 8;
+    const int seqlen_k_limit = seqlen_k - col_base;        // n_col >= seqlen_k  ⟺  offset >= limit
+    const int causal_limit = m_row + mask_shift - col_base; // n_col > threshold ⟺  offset > limit
+
     #pragma unroll
     for (int i = 0; i < 16; i++) {
-        int n_local = (i / 8) * 16 + k_sub * 8 + (i % 8);
-        int n_col_n0 = kv_offset + n_local;
-        int n_col_n1 = kv_offset + 32 + n_local;
+        // Per-register N-column offset relative to col_base.
+        // Constant per i, so the compiler can fold into immediates.
+        constexpr int offsets[16] = {0,1,2,3,4,5,6,7, 16,17,18,19,20,21,22,23};
+        const int off = offsets[i];
 
         // Scale
         s_acc_n0[i] *= scale_s_log2e;
         s_acc_n1[i] *= scale_s_log2e;
 
         // Boundary mask (seqlen_k OOB)
-        if (n_col_n0 >= seqlen_k)
+        if (off >= seqlen_k_limit)
             s_acc_n0[i] = -INFINITY;
-        if (n_col_n1 >= seqlen_k)
+        if (off + 32 >= seqlen_k_limit)
             s_acc_n1[i] = -INFINITY;
 
         // Causal mask
         if constexpr (HasMask) {
-            if (n_col_n0 > m_row + mask_shift)
+            if (off > causal_limit)
                 s_acc_n0[i] = -INFINITY;
-            if (n_col_n1 > m_row + mask_shift)
+            if (off + 32 > causal_limit)
                 s_acc_n1[i] = -INFINITY;
         }
     }

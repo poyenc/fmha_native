@@ -67,7 +67,6 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     auto srd_q = make_buffer_resource(q_base);
     auto srd_k = make_buffer_resource(k_base);
     auto srd_v = make_buffer_resource(v_base);
-    auto srd_o = make_buffer_resource(o_base);
 
     int seqlen_k_start = 0;
     int seqlen_k_end   = seqlen_k;
@@ -101,7 +100,7 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
                     + static_cast<int64_t>(head_idx) * params.seqlen_q;
             }
         }
-        epilog_store(o_acc_d0, o_acc_d1, 0.0f, -INFINITY, srd_o,
+        epilog_store(o_acc_d0, o_acc_d1, 0.0f, -INFINITY,
                      params.stride_o, lse_base, seqlen_q, m_tile_idx, o_base);
         return;
     }
@@ -233,6 +232,6 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
         }
     }
 
-    epilog_store(o_acc_d0, o_acc_d1, rsum, rmax, srd_o,
+    epilog_store(o_acc_d0, o_acc_d1, rsum, rmax,
                  params.stride_o, lse_base, seqlen_q, m_tile_idx, o_base);
 }

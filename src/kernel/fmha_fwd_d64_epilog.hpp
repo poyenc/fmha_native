@@ -2,7 +2,7 @@
 #include "fmha_fwd_d64_gemm.hpp"
 
 // ================================================================
-// Phase 2: Epilog — normalize O_acc, compute LSE, bf16 store
+// Phase 3: Epilog — normalize O_acc, compute LSE, bf16 buffer_store
 // ================================================================
 //
 // O_acc layout (TransposedC + SwizzleA):
@@ -11,7 +11,7 @@
 //   where swz swaps bits 2,3.
 //
 // Store: 8 × buffer_store_dwordx2 (4 bf16 per store = 32 bf16 total).
-// bf16 truncation (not RNE). From Phase 1 K7.
+// bf16 truncation via v_perm_b32 (not RNE). Matches CK epilog pattern.
 //
 // LSE: log(rsum) + rmax / log2e. Stored to lse_base[m_row].
 
@@ -19,93 +19,79 @@ __device__ __forceinline__ void epilog_store(
     v16f& o_acc_d0, v16f& o_acc_d1,
     float rsum,
     float rmax,
-    __amdgpu_buffer_rsrc_t o_srd,
     int stride_o,             // in bf16 elements
     float* lse_base,
     int seqlen_q,
     int m_tile_idx,
-    __hip_bfloat16* o_base = nullptr)  // raw pointer for element-wise store
+    __hip_bfloat16* o_base)
 {
     const int lane_id = threadIdx.x & 63;
     const int warp_id = threadIdx.x >> 6;
     const int k_sub   = lane_id >> 5;
     const int m_row   = (lane_id & 31) + 32 * warp_id;
+    const int abs_m_row = m_tile_idx * kM0 + m_row;
 
-    // Guard: skip if this thread's M-row is OOB
-    if (m_tile_idx * kM0 + m_row >= seqlen_q) return;
+    // Build SRD: stride=0, num_records = min(seqlen_q * stride_o * 2, 0x7FFFFFFF)
+    int num_records = (int)min((int64_t)seqlen_q * stride_o * 2, (int64_t)0x7FFFFFFF);
+    auto o_srd = __builtin_amdgcn_make_buffer_rsrc(
+        o_base, 0, num_records, 0x00020000);
 
     // Normalize O_acc by rsum
     float inv_sum = (rsum > 0.0f) ? 1.0f / rsum : 0.0f;
-    #pragma unroll
-    for (int i = 0; i < 16; i++) {
-        o_acc_d0[i] *= inv_sum;
-        o_acc_d1[i] *= inv_sum;
-    }
 
-    // Store LSE
-    constexpr float kLog2e = 1.4426950408889634f;
-    if (lse_base && k_sub == 0) {
-        int abs_m_row = m_tile_idx * kM0 + m_row;
+    // Store LSE (raw pointer, unchanged from Phase 2)
+    if (lse_base && k_sub == 0 && abs_m_row < seqlen_q) {
         float lse_val = (rsum > 0.0f)
             ? (__builtin_amdgcn_logf(rsum) + rmax) * 0.6931471805599453f
             : -INFINITY;
         lse_base[abs_m_row] = lse_val;
     }
 
-    // Element-wise store: d_col = swz((r/8)*16 + k_sub*8 + (r%8))
-    const int abs_m_row = m_tile_idx * kM0 + m_row;
+    // Normalize + pack per pair: fp32 → bf16 truncation via v_perm_b32
+    // Process o_acc_d0[0..15] and o_acc_d1[0..15] = 32 fp32 → 16 bf16x2 pairs
+    // CK pattern: interleaved pk_mul + perm, reusing 2 temp VGPRs
+    constexpr unsigned kBf16TruncSel = 0x07060302;
+    unsigned bf16_packed[16]; // 16 dwords = 8 dwordx2 stores
 
     #pragma unroll
-    for (int r = 0; r < 32; ++r) {
-        const v16f& o_acc = (r < 16) ? o_acc_d0 : o_acc_d1;
-        int local_r = (r < 16) ? r : r - 16;
-        int d_nom = (r / 8) * 16 + k_sub * 8 + (r % 8);
-        int d_col = swz(d_nom);
-        uint16_t bf = f32_to_bf16_trunc(o_acc[local_r]);
-        o_base[abs_m_row * stride_o + d_col] = *reinterpret_cast<const __hip_bfloat16*>(&bf);
+    for (int i = 0; i < 8; i++) {
+        float v0 = o_acc_d0[2 * i]     * inv_sum;
+        float v1 = o_acc_d0[2 * i + 1] * inv_sum;
+        bf16_packed[i] = __builtin_amdgcn_perm(
+            reinterpret_cast<unsigned&>(v1),
+            reinterpret_cast<unsigned&>(v0),
+            kBf16TruncSel);
     }
-}
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        float v0 = o_acc_d1[2 * i]     * inv_sum;
+        float v1 = o_acc_d1[2 * i + 1] * inv_sum;
+        bf16_packed[8 + i] = __builtin_amdgcn_perm(
+            reinterpret_cast<unsigned&>(v1),
+            reinterpret_cast<unsigned&>(v0),
+            kBf16TruncSel);
+    }
 
-// ================================================================
-// Legacy function — used by current _device.hpp until Task 2.6.
-// DO NOT use in new Phase 2 code. Will be removed after 2.6.
-// ================================================================
+    // Compute voffset: single VGPR reused across all 8 stores
+    // col_base accounts for k_sub's position within swizzled layout
+    int col_base = swz(k_sub * 8);
+    int voffset = (abs_m_row * stride_o + col_base) * 2;
 
-__device__ inline void epilog_store_o(v16f& o_acc_n0, v16f& o_acc_n1,
-                                       const float (&rsum)[16],
-                                       const float (&rmax)[16],
-                                       __hip_bfloat16* o_base,
-                                       int stride_o,
-                                       float* lse_base,
-                                       float log2e,
-                                       int seqlen_q,
-                                       int m_tile_idx,
-                                       int warp_id,
-                                       int lane_id) {
-    int k_sub = lane_id >> 5;
-    int n_pos = lane_id & 31;
+    // 8 buffer_store_dwordx2 with per-store boundary guard
+    bool row_in_bounds = (abs_m_row < seqlen_q);
 
-    for (int i = 0; i < 16; i++) {
-        int m_row = m_tile_idx * kM0 + warp_id * 32 + k_sub * 16 + i;
-        if (m_row >= seqlen_q) continue;
-
-        float inv_sum = (rsum[i] > 0.0f) ? 1.0f / rsum[i] : 0.0f;
-        float o_n0 = o_acc_n0[i] * inv_sum;
-        float o_n1 = o_acc_n1[i] * inv_sum;
-
-        __hip_bfloat16* o_row = o_base + static_cast<int64_t>(m_row) * stride_o;
-
-        uint16_t bf_n0 = f32_to_bf16_trunc(o_n0);
-        uint16_t bf_n1 = f32_to_bf16_trunc(o_n1);
-
-        o_row[n_pos]      = *reinterpret_cast<const __hip_bfloat16*>(&bf_n0);
-        o_row[32 + n_pos] = *reinterpret_cast<const __hip_bfloat16*>(&bf_n1);
-
-        if (lse_base && n_pos == 0) {
-            float lse_val = (rsum[i] > 0.0f)
-                ? __builtin_amdgcn_logf(rsum[i]) * 0.6931471805599453f + rmax[i] / log2e
-                : -INFINITY;
-            lse_base[m_row] = lse_val;
+    #pragma unroll
+    for (int store_idx = 0; store_idx < 8; store_idx++) {
+        if (row_in_bounds) {
+            // Each store writes 2 dwords = 4 bf16 elements
+            v2i data;
+            data[0] = static_cast<int>(bf16_packed[store_idx * 2]);
+            data[1] = static_cast<int>(bf16_packed[store_idx * 2 + 1]);
+            __builtin_amdgcn_raw_buffer_store_b64(
+                data, o_srd, voffset, store_idx * 16, 0);
         }
     }
+
+    // Match CK: s_waitcnt vmcnt(0) after all stores
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 }

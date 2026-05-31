@@ -128,12 +128,19 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     int kv_offset = seqlen_k_start;
     int k_col_offset = 0;
 
+    // After Q load, before K prefetch — match CK prologue barriers 1-2
+    __builtin_amdgcn_sched_barrier(0);
+    __builtin_amdgcn_sched_barrier(0);
+
     // PROLOGUE
     async_copy_k_subtile(lds, srd_k, params.stride_k, kv_offset, k_col_offset, LdsSeq[0]);
     k_col_offset += kK0;
 
+    __builtin_amdgcn_sched_barrier(0); // prologue barrier 3
+
     // TILE LOOP
     int i_total_loops = 0;
+    __builtin_amdgcn_sched_barrier(0); // prologue barrier 4
     do {
         // GEMM0
         v16f s_acc_n0, s_acc_n1;
@@ -145,6 +152,7 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             k_col_offset += kK0;
             async_copy_fence();
             s_barrier();
+            __builtin_amdgcn_sched_barrier(0); // hot-loop barrier 5 — GEMM0 entry
             gemm0_subtile(s_acc_n0, s_acc_n1, slice_q(q_regs, 0), lds, LdsSeq[0]);
         }
 
@@ -153,9 +161,12 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             s_barrier();
             v2i v_k3_0, v_k3_1;
             load_v_from_dram(v_k3_0, v_k3_1, srd_v, params.stride_v, kv_offset);
+            __builtin_amdgcn_sched_barrier(0); // hot-loop barrier 6 — after V prefetch
             gemm0_subtile(s_acc_n0, s_acc_n1, slice_q(q_regs, 1), lds, LdsSeq[1]);
 
-            __builtin_amdgcn_sched_barrier(0);
+            __builtin_amdgcn_sched_barrier(0); // hot-loop barrier 7 — GEMM0 tail
+
+            __builtin_amdgcn_sched_barrier(0x1); // hot-loop barrier 8 — GEMM0 exit, VALU-only
 
             // V staging
             s_waitcnt_vmcnt_0();
@@ -164,11 +175,14 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             load_v_from_dram(v1_k3_0, v1_k3_1, srd_v, params.stride_v, kv_offset + 32);
             s_waitcnt_vmcnt_0();
 
+            __builtin_amdgcn_sched_barrier(0); // hot-loop barrier 10 — post V-staging
+
             // Softmax
             float scale_s_log2e = params.scale;
             softmax_scale_and_mask<HasMask>(s_acc_n0, s_acc_n1, scale_s_log2e,
                                             seqlen_k, kv_offset, abs_m_row, mask_shift);
             float m_new = softmax_row_max(s_acc_n0, s_acc_n1);
+            __builtin_amdgcn_sched_barrier(0x7F); // hot-loop barrier 9 — after bpermute, all non-MFMA
             if (m_new == -INFINITY) m_new = rmax;
             softmax_exp2(s_acc_n0, s_acc_n1, m_new);
             float l_new = softmax_row_sum(s_acc_n0, s_acc_n1);

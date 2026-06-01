@@ -76,36 +76,38 @@ Run a single binary directly, e.g. the causal cases of the full-kernel suite:
 
 ## Performance
 
-Measured on **MI300X (gfx942)**, d64 bf16, via `scripts/run-benchmark.sh` (6 runs per config,
-first dropped), compared against Composable Kernel (CK) `tile_example_fmha_fwd` built and run
-back-to-back on the same GPU. TFLOPS is average-based on both sides (FLOP conventions match
-within <0.1%), so `native/CK` is an apples-to-apples throughput ratio (higher is better).
+Measured on **MI300X (gfx942)**, d64 bf16, via `scripts/run-benchmark.sh` (native) and
+`example/ck_tile/01_fmha/script/benchmark_fwd_sp3_compare.sh` (CK), built and run back-to-back
+on the same GPU. Both use the identical 6-run framework: 6 runs per config, drop the first,
+**average** runs 2–6 (each run is itself an average over 20 iterations). TFLOPS is average-based
+on both sides (FLOP conventions match within <0.1%), so `native/CK` is an apples-to-apples
+throughput ratio (higher is better).
 
 Non-causal (`--mask 0`):
 
 | B | H | S | native | CK | native/CK |
 |---|---|------|------|------|------|
-| 8 | 16 | 1024  | 291.7 | 318.4 | 91.6% |
-| 4 | 16 | 2048  | 340.1 | 356.1 | 95.5% |
-| 2 | 16 | 4096  | 367.9 | 378.4 | 97.2% |
-| 1 | 8  | 8192  | 327.1 | 353.7 | 92.5% |
-| 1 | 16 | 8192  | 381.1 | 396.1 | 96.2% |
-| 1 | 8  | 16384 | 398.1 | 415.1 | 95.9% |
-| 1 | 4  | 32768 | 397.2 | 412.6 | 96.3% |
-| 1 | 2  | 40000 | 327.9 | 345.3 | 95.0% |
+| 8 | 16 | 1024  | 300.7 | 307.6 | 97.7% |
+| 4 | 16 | 2048  | 346.8 | 350.0 | 99.1% |
+| 2 | 16 | 4096  | 364.4 | 377.8 | 96.4% |
+| 1 | 8  | 8192  | 328.2 | 347.1 | 94.6% |
+| 1 | 16 | 8192  | 382.3 | 393.2 | 97.2% |
+| 1 | 8  | 16384 | 400.0 | 412.4 | 97.0% |
+| 1 | 4  | 32768 | 396.9 | 412.6 | 96.2% |
+| 1 | 2  | 40000 | 328.0 | 343.0 | 95.6% |
 
 Causal (`--mask 1`, ×0.5 FLOP convention):
 
 | B | H | S | native | CK | native/CK |
 |---|---|------|------|------|------|
-| 8 | 16 | 1024  | 206.4 | 228.0 | 90.5% |
-| 4 | 16 | 2048  | 263.3 | 289.7 | 90.9% |
-| 2 | 16 | 4096  | 297.8 | 312.8 | 95.2% |
-| 1 | 8  | 8192  | 248.6 | 253.3 | 98.2% |
-| 1 | 16 | 8192  | 352.2 | 366.7 | 96.1% |
-| 1 | 8  | 16384 | 370.2 | 378.8 | 97.7% |
-| 1 | 4  | 32768 | 387.1 | 397.8 | 97.3% |
-| 1 | 2  | 40000 | 299.7 | 241.7 | 124.0% |
+| 8 | 16 | 1024  | 202.5 | 222.4 | 91.1% |
+| 4 | 16 | 2048  | 264.0 | 286.7 | 92.1% |
+| 2 | 16 | 4096  | 297.1 | 310.9 | 95.6% |
+| 1 | 8  | 8192  | 247.3 | 249.6 | 99.1% |
+| 1 | 16 | 8192  | 351.4 | 361.7 | 97.2% |
+| 1 | 8  | 16384 | 369.6 | 380.1 | 97.2% |
+| 1 | 4  | 32768 | 386.5 | 395.4 | 97.7% |
+| 1 | 2  | 40000 | 298.9 | 243.3 | 122.9% |
 
 TFLOPS are in TFLOP/s. The `B1 H2 S40000` causal config is ragged/low-occupancy (CK regresses
 there) — treat it as an outlier. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §5 for why

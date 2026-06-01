@@ -18,7 +18,7 @@
 #include "runner/fmha_params.hpp"
 #include "runner/buffers.hpp"
 
-// Kernel declarations (defined in fmha_fwd_d64_kernel.cpp)
+// Kernel declarations (defined in src/fused/kernel.cpp)
 __global__ void fmha_fwd_d64_bf16_msk0(FmhaFwdParams params);
 __global__ void fmha_fwd_d64_bf16_msk1(FmhaFwdParams params);
 __global__ void fmha_fwd_d64_bf16_msk0_varlen(FmhaFwdParams params);

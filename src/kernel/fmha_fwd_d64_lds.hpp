@@ -32,7 +32,13 @@ __device__ __forceinline__ void s_waitcnt_lgkmcnt_1() {
     asm volatile("s_waitcnt lgkmcnt(1)" ::: "memory");
 }
 
-__device__ __forceinline__ void async_copy_fence() {
+__device__ __forceinline__ void async_load_fence(int cnt = 0) {
+    if (__builtin_constant_p(cnt)) {
+        switch (cnt) {
+        case 0: asm volatile("s_waitcnt vmcnt(0)" ::: "memory"); return;
+        case 4: asm volatile("s_waitcnt vmcnt(4)" ::: "memory"); return;
+        }
+    }
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 }
 
@@ -90,7 +96,7 @@ __device__ __forceinline__ int k_lds_elem_offset(int j, int d) {
 //   m0 = buf_base_bytes(buf_idx) + warp_id * 0x110
 //   Between loads: m0 += 0x440 (1088 bytes)
 //
-// Caller must issue async_copy_fence() + s_barrier() after all loads land.
+// Caller must issue async_load_fence() + s_barrier() after all loads land.
 
 __device__ __forceinline__ void async_copy_k_subtile(
     char* lds,
@@ -100,27 +106,27 @@ __device__ __forceinline__ void async_copy_k_subtile(
     int k_col_offset,     // column offset (0 or 32) selecting which k0 half
     int buf_idx)
 {
-    // VGPR staging: load K to registers, then write to padded LDS layout.
-    // Thread mapping (matches old copy_k_to_lds_2x_guarded):
-    //   n_pos  = tid / 4    (0..63)
-    //   k_group = tid % 4   (0..3)
-    //   k_base = k_group * 8  (0, 8, 16, 24)
-    // Each thread loads 8 contiguous bf16 via buffer_load_b128.
-    int tid = threadIdx.x;
-    int n_pos = tid >> 2;       // 0..63
-    int k_group = tid & 3;     // 0..3
-    int k_base = k_group * 8;  // 0, 8, 16, 24
-    int stride_bytes = stride_k * 2;
+    const int lane_id = threadIdx.x & 63;
+    const int warp_id = threadIdx.x >> 6;
 
-    int row = kv_offset + n_pos;
-    int dram_off = row * stride_bytes + (k_col_offset + k_base) * 2;
+    const int d_in_chunk = (lane_id & 15) * 2;           // 0,2,...,30 (K-dim)
+    const int n_base     = (lane_id >> 4) * 4 + warp_id; // seqlen_k position
 
-    v4i data = __builtin_amdgcn_raw_buffer_load_b128(k_srd, dram_off, 0, 0);
-    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    const int stride_bytes = stride_k * 2;
+    const int m0_base = buf_base_bytes(buf_idx) + warp_id * 0x110;
 
-    // Write to LDS using k_lds_elem_offset — must match GEMM0's lds_elem_offset reads.
-    int lds_off = buf_base_bytes(buf_idx) + k_lds_elem_offset(n_pos, k_base) * 2;
-    *reinterpret_cast<v4i*>(lds + lds_off) = data;
+    #pragma unroll
+    for (int issue = 0; issue < 4; ++issue) {
+        const int m0_bytes = m0_base + issue * 0x440;
+        lds_ptr_t lds_dst = (lds_ptr_t)(lds + m0_bytes);
+
+        const int n_pos = issue * 16 + n_base;
+        const int row = kv_offset + n_pos;
+        const int voffset = row * stride_bytes + (k_col_offset + d_in_chunk) * 2;
+
+        __builtin_amdgcn_raw_ptr_buffer_load_lds(
+            k_srd, lds_dst, /*size=*/4, voffset, /*soffset=*/0, /*offset=*/0, /*aux=*/0);
+    }
 }
 
 // ---- V load from DRAM (buffer_load_dwordx2) ----

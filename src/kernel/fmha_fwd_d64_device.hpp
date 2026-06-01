@@ -150,14 +150,14 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
         {
             async_copy_k_subtile(lds, srd_k, params.stride_k, kv_offset, k_col_offset, LdsSeq[1]);
             k_col_offset += kK0;
-            async_copy_fence();
+            async_load_fence(4);
             s_barrier();
             __builtin_amdgcn_sched_barrier(0); // hot-loop barrier 5 — GEMM0 entry
             gemm0_subtile(s_acc_n0, s_acc_n1, slice_q(q_regs, 0), lds, LdsSeq[0]);
         }
 
         {
-            async_copy_fence();
+            async_load_fence(0);
             s_barrier();
             __builtin_amdgcn_sched_barrier(0); // CK barrier 2 — after s_barrier, before V-load + GEMM0.1
             v2i v_k3_0, v_k3_1;

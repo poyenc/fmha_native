@@ -169,7 +169,8 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             // Softmax mask + row_max (scale deferred to exp)
             float scale_s = params.scale;
             softmax_mask<HasMask>(s_acc_n0, s_acc_n1,
-                                  seqlen_k, kv_offset, abs_m_row, mask_shift);
+                                  seqlen_k, kv_offset, abs_m_row, mask_shift,
+                                  m_tile_idx * kM0);
             float m_new = softmax_row_max(s_acc_n0, s_acc_n1, rmax);
             __builtin_amdgcn_sched_barrier(0x7F); // CK barrier 5 — after bpermute, all non-MFMA
 

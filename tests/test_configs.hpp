@@ -75,5 +75,23 @@ inline const std::vector<TestCase> kAllFull = {
     {"D64VarlenGqaMaskLse", 2, 8, 512, 64, 2, 0, 1, 1, 0, {512, 256}},
     {"D64VarlenLseNomask", 2, 4, 512, 64, 0, 0, 0, 1, 0, {512, 256}},
     {"D64VarlenAsymMask", 2, 4, 256, 64, 0, 512, 1, 0, 0, {256, 128}},
+    // === D64 Causal full-tile-skip coverage (softmax_mask HasMask fast path) ===
+    // These stress the below-diagonal full-tile skip added to softmax_mask:
+    // tiles fully below the diagonal must skip masking, the diagonal/boundary
+    // tile must still mask. kM0=128, kN0=64.
+    // Deep square: M-tile 5 (base 640) skips kv tiles 0..576, masks tile 640.
+    // kv_offset=576 hits kv_offset+kN0=640 == base+1=641 minus one (the +1 edge).
+    {"D64CausalDeepSquare", 1, 2, 768, 64, 0, 0, 1, 0, 0},
+    {"D64CausalDeepSquareLse", 1, 2, 768, 64, 0, 0, 1, 1, 0},
+    // Ragged tail (768+64=832 = 6*128+64): half-empty last M-tile, like S=40000.
+    {"D64CausalRaggedTail", 1, 2, 832, 64, 0, 0, 1, 0, 0},
+    // Deep ragged multi-tile (1100 = 8*128+76): many below-diag tiles + ragged.
+    {"D64CausalDeepRagged", 1, 2, 1100, 64, 0, 0, 1, 0, 0},
+    // Tile-aligned shift (mask_shift = Sk-Sq = 128 = kM0): diagonal on M-tile edge.
+    {"D64CausalShift128", 1, 2, 256, 64, 0, 384, 1, 0, 0},
+    // N-tile-aligned shift (mask_shift = 64 = kN0): diagonal on N-tile edge.
+    {"D64CausalShift64", 1, 2, 256, 64, 0, 320, 1, 0, 0},
+    // GQA + deep ragged causal: exercises skip path under head grouping.
+    {"D64CausalGqaDeepRagged", 1, 8, 900, 64, 2, 0, 1, 0, 0},
 };
 // clang-format on

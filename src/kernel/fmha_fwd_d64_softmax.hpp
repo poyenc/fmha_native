@@ -33,7 +33,8 @@ __device__ __forceinline__ void softmax_mask(
     int seqlen_k,
     int kv_offset,
     int m_row,         // this thread's M-row index
-    int mask_shift)    // seqlen_k - seqlen_q (for causal)
+    int mask_shift,    // seqlen_k - seqlen_q (for causal)
+    int m_tile_base)   // m_tile_idx * kM0 (wave-uniform min row of this M-tile)
 {
     const int k_sub = (threadIdx.x & 63) >> 5;
 
@@ -52,6 +53,14 @@ __device__ __forceinline__ void softmax_mask(
     if constexpr (!HasMask) {
         // Max absolute column in this tile = kv_offset + 63 (k_sub=1, n1, off=23).
         if (kv_offset + kN0 <= seqlen_k)
+            return;
+    } else {
+        // Causal: a tile fully BELOW the diagonal needs no masking. The tightest
+        // causal limit is at the topmost row (m_tile_base). If the whole tile is
+        // left of that row's diagonal AND in-bounds, every element is valid.
+        // Only the diagonal/last edge tile takes the slow path (CK's IsEdgeTile).
+        if (kv_offset + kN0 <= m_tile_base + mask_shift + 1 &&
+            kv_offset + kN0 <= seqlen_k)
             return;
     }
 

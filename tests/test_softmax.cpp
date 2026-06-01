@@ -10,7 +10,7 @@
 #include "runner/bf16_utils.hpp"
 #include "components_ref/ref_softmax.hpp"
 #include "components_ref/ref_qk_gemm.hpp"
-#include "kernels/softmax.hpp"
+#include "components/softmax.hpp"
 
 static std::string g_golden_full;
 static std::string g_golden_partial;

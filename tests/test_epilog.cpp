@@ -12,7 +12,7 @@
 #include "components_ref/ref_qk_gemm.hpp"
 #include "components_ref/ref_softmax.hpp"
 #include "components_ref/ref_pv_gemm.hpp"
-#include "kernels/epilog.hpp"
+#include "components/epilog.hpp"
 
 static std::string g_golden_full;
 static std::string g_golden_partial;

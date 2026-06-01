@@ -9,7 +9,7 @@
 
 #include "runner/bf16_utils.hpp"
 #include "components_ref/ref_qk_gemm.hpp"
-#include "kernels/qk_gemm.hpp"
+#include "components/qk_gemm.hpp"
 
 static std::string g_golden_full;
 static std::string g_golden_partial;

@@ -8,7 +8,7 @@
 
 #include "runner/bf16_utils.hpp"
 #include "components_ref/ref_k_lds.hpp"
-#include "kernels/k_lds.hpp"
+#include "components/k_lds.hpp"
 
 // Optional golden directory (set via --golden=<dir>). Empty => skip golden check.
 static std::string g_golden_full;

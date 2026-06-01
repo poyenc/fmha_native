@@ -1,3 +1,18 @@
+// =============================================================================
+// UNIT TEST: GEMM0 component (src/components/qk_gemm.hpp), pipeline STAGE 2.
+//
+// What it validates: that the standalone GEMM0 kernel produces the correct
+// S = Q*K^T thread-buffer image. HOW, with two independent oracles:
+//   1. MatchesCpuRef  — vs ref_qk_gemm() (CPU brute force). Always runs.
+//   2. MatchesGolden  — vs CK's dump_reg slot 1 (S_ACC), bit-for-bit. Runs ONLY
+//      if a --golden-full / --golden-partial dir is passed; otherwise SKIPPED.
+// Plus a few CPU-ref-only edge cases (min tile, full M0, single K column).
+//
+// Inputs are the deterministic Q/K formulas from the CK dump manifest so the
+// golden comparison is meaningful. Tolerance is loose (rtol 2e-3): MFMA fp32
+// accumulation order differs from the CPU sum by a few ULPs; a STRUCTURAL
+// (layout) bug instead shows up as large diffs. See compare().
+// =============================================================================
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
 #include <cstdint>

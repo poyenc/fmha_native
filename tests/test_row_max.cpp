@@ -1,3 +1,14 @@
+// =============================================================================
+// UNIT TEST: row_max component (src/components/row_max.hpp), pipeline STAGE 3.
+//
+// What it validates: the intra-lane + single-ds_bpermute row-max reduction.
+// HOW:
+//   - The kernel needs an S_acc input, so the CPU-ref tests first synthesize one
+//     with ref_qk_gemm (see compute_s_acc), then diff the kernel's rmax against
+//     ref_row_max(). EXACT compare — row-max is just fmaxf, no FMA rounding.
+//   - MatchesGolden feeds the kernel the GOLDEN S_ACC (slot 1) instead, and
+//     diffs against golden RMAX (slot 2). SKIPS without a golden dir.
+// =============================================================================
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
 #include <cstdint>

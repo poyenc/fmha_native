@@ -2,6 +2,22 @@
 #include <hip/hip_runtime.h>
 #include <cstdint>
 
+// =============================================================================
+// COMPONENT (TEST-ONLY): row-max reduction — pipeline STAGE 3 of 7.
+//
+// Standalone isolation of the softmax row-max step, used ONLY by
+// tests/test_row_max.cpp. Golden-verified, NOT #included by src/fused/.
+// CPU oracle: src/components_ref/ref_row_max.{hpp,cpp}.
+//
+// WHY ONLY ONE cross-lane shuffle: in the TransposedC layout each lane already
+// holds its M-row's values for 32 of the 64 N-columns, and all 32 lanes in a
+// k_sub half hold the SAME 32 columns. So an intra-lane max over the 32 regs
+// already covers half the row; the two halves (lane and lane^32) hold the
+// complementary columns. A SINGLE ds_bpermute(lane^32) brings the partner's
+// half-max in, and one more fmaxf finishes the full 64-column row max. This
+// matches CK's ISA (exactly 1 ds_bpermute for rowmax, 1 for rowsum).
+// =============================================================================
+//
 // Phase 1 Kernel 3 -- test_row_max (cross-half ds_bpermute reduction)
 //
 // Reproduces CK's row-max reduction over S_acc, matching golden dump_reg

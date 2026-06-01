@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <cstring>
 
-// n_col for thread tid, register r (TransposedC distribution)
+// Map a (tid, reg r) slot back to the N-column it represents in the
+// TransposedC distribution. Mirrors the GPU's n_col formula so masking and the
+// max/sum reductions operate on the same logical columns.
 static int softmax_n_col(int tid, int r) {
     int lane = tid % 64;
     int k_sub = lane >> 5;

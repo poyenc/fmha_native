@@ -1,9 +1,15 @@
 // FMHA test configurations — D64 parameterized cases.
 //
-// Each entry specifies {name, batch, heads, seq, hdim, kv_heads, kv_seq,
-// mask, lse, opt, varlen_seqs}.  Covers smoke tests, feature combos
-// (GQA, MQA, causal mask, LSE, asymmetric seq), edge cases (small/odd
-// seq lengths), and varlen batching.
+// kAllFull is the master problem-size matrix shared by BOTH full-kernel suites
+// (test_fmha_fwd_d64.cpp and test_fmha_gpu_ref.cpp) via INSTANTIATE_TEST_SUITE_P
+// + test_name(). Add a row here and both suites pick it up automatically.
+//
+// Each entry is a TestCase (see test_params.hpp): {name, batch, heads, seq,
+// hdim, kv_heads, kv_seq, mask, lse, opt, varlen_seqs}.  Covers smoke tests,
+// feature combos (GQA, MQA, causal mask, LSE, asymmetric seq), edge cases
+// (small/odd seq lengths), and varlen batching. kv_heads/kv_seq = 0 means
+// "derive from q" (handled by make_params). The trailing brace list, when
+// present, gives per-batch sequence lengths for varlen cases.
 
 #pragma once
 #include "test_params.hpp"

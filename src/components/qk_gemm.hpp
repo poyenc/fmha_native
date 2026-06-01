@@ -2,6 +2,33 @@
 #include <hip/hip_runtime.h>
 #include <cstdint>
 
+// =============================================================================
+// COMPONENT (TEST-ONLY): GEMM0 (S = Q * K^T) — pipeline STAGE 2 of 7.
+//
+// Standalone isolation of attention's first matmul, used ONLY by
+// tests/test_qk_gemm.cpp. Golden-verified, NOT #included by src/fused/.
+// CPU oracle: src/components_ref/ref_qk_gemm.{hpp,cpp}.
+//
+// MENTAL MODEL of the output layout (shared across ALL components — learn it
+// once here):
+//   - 256 threads = 4 warps x 64 lanes. The MFMA produces "TransposedC" output:
+//       m_row (seqq) = (lane%32) + 32*warp      -> each thread owns ONE M-row
+//       free-dim reg r maps to col = (r/8)*16 + (lane/32)*8 + (r%8)
+//   - k_sub = lane/32 (0 or 1) splits each lane into a "half"; the two halves
+//     of a warp hold COMPLEMENTARY column sets, merged later via ds_bpermute.
+//
+// GEMM CONVENTION (CK): A operand lives in LDS, B operand in registers. For
+// GEMM0: A = K (LDS), B = Q (regs). The HW MFMA arg order is swapped relative
+// to the CK A/B naming, i.e. mfma(hw_a=K, hw_b=Q, C=S_acc).
+//
+// SwizzleA: the bare 32x32x8 MFMA emits its register dim in groups-of-4, but
+// golden S_acc is groups-of-8. The fix is to read the K(A) row with bits 2,3 of
+// (lane%32) swapped (see qk_swz below). With that single permutation the 16
+// MFMA reproduce golden bit-for-bit. This is the ONE non-obvious trick in GEMM0.
+//
+// bf16 cast throughout the repo = TRUNCATION (drop low 16 bits, no rounding).
+// =============================================================================
+//
 // Phase 1 Kernel 2 — test_qk_gemm (native GEMM0: S = Q * K^T)
 //
 // Reproduces CK's GEMM0 MFMA C-output (S_acc) byte/value-exact against golden

@@ -2,6 +2,23 @@
 #include <hip/hip_runtime.h>
 #include <cstdint>
 
+// =============================================================================
+// COMPONENT (TEST-ONLY): epilogue — pipeline STAGE 7 of 7.
+//
+// Standalone isolation of the output epilogue, used ONLY by
+// tests/test_epilog.cpp. Golden-verified, NOT #included by src/fused/.
+// CPU oracle: src/components_ref/ref_epilog.{hpp,cpp}.
+//
+// WHAT it does: divide the raw GEMM1 accumulator O_acc by the softmax row-sum
+// RSUM (the deferred normalization of flash attention), truncate to bf16, and
+// store to DRAM. No LDS, no shuffle — straight register->DRAM.
+//
+// LAYOUT NOTE: O_acc is in GEMM1's SwizzleA'd TransposedC layout, so register r
+// maps to DRAM column d_col = swz((r/8)*16 + k_sub*8 + (r%8)). The 32 regs are
+// emitted as 8 buffer_store_dwordx2 of 4 contiguous bf16 each; the long inline
+// comment below works the swz() mapping out explicitly for k_sub=0.
+// =============================================================================
+//
 // Phase 1 Kernel 7 -- test_epilog (Default2D epilogue: normalize + bf16 store)
 //
 // Reproduces CK's Default2DEpilogue: O_acc / RSUM → bf16 → buffer_store.

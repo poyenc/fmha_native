@@ -2,6 +2,28 @@
 #include <hip/hip_runtime.h>
 #include <cstdint>
 
+// =============================================================================
+// COMPONENT (TEST-ONLY): softmax — pipeline STAGE 4 of 7.
+//
+// Standalone isolation of the full single-tile softmax, used ONLY by
+// tests/test_softmax.cpp. Golden-verified, NOT #included by src/fused/.
+// CPU oracle: src/components_ref/ref_softmax.{hpp,cpp}.
+//
+// KEY NUMERICS for newcomers:
+//   - This GPU path is BASE-2: P = exp2(scale_s*log2(e) * (S - rmax)). The
+//     __builtin_amdgcn_exp2f intrinsic lowers to v_exp_f32 (which computes
+//     2^x). CK runs with FAST_EXP2=1, hence exp2 instead of expf.
+//   - Folding log2(e) into the scale converts the natural-e softmax into the
+//     base-2 domain WITHOUT changing the probabilities (exp(x)=exp2(x*log2 e)).
+//     The CPU oracle (ref_softmax.cpp) uses exp2f too, so they agree exactly;
+//     note the *full-kernel* CPU references elsewhere use natural expf instead.
+//   - bf16 cast of P = TRUNCATION (keep upper 16 bits), not round-to-nearest.
+//   - rmax/rsum each use ONE cross-half ds_bpermute, same trick as row_max.
+//
+// MASKING: a column is valid only if n_col < (seqlen_k - kv_offset); masked
+// columns are set to -INFINITY so their exp2 contributes 0 to P and rsum.
+// =============================================================================
+//
 // Phase 1 Kernel 4 -- test_softmax (scale + mask + exp2 + rowsum + bf16 cast)
 //
 // Reproduces CK's single-tile softmax, matching golden dump_reg slot 3 (P).

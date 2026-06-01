@@ -1,3 +1,15 @@
+// =============================================================================
+// UNIT TEST: softmax component (src/components/softmax.hpp), pipeline STAGE 4.
+//
+// What it validates: P, rmax, and rsum from the base-2 softmax. HOW:
+//   - CPU-ref tests build S_acc via ref_qk_gemm, run the kernel, and diff each
+//     output against ref_softmax(). P and rmax are compared EXACTLY (both sides
+//     use exp2 + truncation); rsum uses a small atol because summation order of
+//     the cross-half merge can differ by ULPs.
+//   - MatchesGolden feeds golden S_ACC (slot 1) and diffs P vs slot 3, rmax vs
+//     slot 2. SKIPS without a golden dir.
+// scale_s = 0.125 = 1/sqrt(64); the kernel folds in log2(e) internally.
+// =============================================================================
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
 #include <cstdint>

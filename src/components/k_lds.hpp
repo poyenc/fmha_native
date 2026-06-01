@@ -2,6 +2,26 @@
 #include <hip/hip_runtime.h>
 #include <cstdint>
 
+// =============================================================================
+// COMPONENT (TEST-ONLY): K-LDS staging — pipeline STAGE 1 of 7.
+//
+// New to this repo? Read this first. The production kernel lives in src/fused/;
+// this file is a STANDALONE isolation of just the "stage K into LDS" step, used
+// ONLY by the unit test tests/test_k_lds.cpp. It is golden-verified (byte-exact
+// against a CK reference dump) and is NOT #included by src/fused/. Its sibling
+// CPU oracle is src/components_ref/ref_k_lds.{hpp,cpp}.
+//
+// WHAT this stage does: copies a 64-row x 64-headdim K sub-tile from DRAM into
+// LDS (shared memory) using the GOLDEN-VERIFIED swizzled layout that GEMM0
+// later expects to read. The copy uses buffer_load_dword ... lds (a direct
+// DRAM->LDS path that never lands in a VGPR), then the kernel cooperatively
+// dumps the LDS region back to DRAM so the test can byte-compare it.
+//
+// WHY the layout is "weird": MFMA wants K laid out so each lane reads its
+// operand contiguously; the offset formula below is that padded, bank-conflict-
+// avoiding LDS arrangement. It is empirical (matched to CK), not derived here.
+// =============================================================================
+//
 // Phase 1 Kernel 1 — test_k_lds
 //
 // Stages a 64x64 K tile from DRAM into LDS using CK's GOLDEN-VERIFIED async
@@ -19,10 +39,11 @@
 //   m0 = chunk*4608 + w*0x110 + i*0x440   (bytes; 0x110=136 elems, 0x440=544).
 // One can verify  m0 + L*4 == 2*offset_elems(j,d0)  identically.
 //
-// NOTE (impl): the existing src/kernel/fmha_fwd_d64_lds.hpp::async_copy_k_slice
-// uses n_base = warp*4 + (lane>>4), which swaps the warp/lane-group factors and
-// reproduces only 1024/4096 slots correctly. This kernel uses the CORRECT
-// n_base = (lane>>4)*4 + warp. The native kernel is left untouched until Phase 2.
+// HISTORY (impl): an earlier draft of the native kernel used the WRONG factor
+// order n_base = warp*4 + (lane>>4), which reproduced only 1024/4096 slots. This
+// component pinned down the CORRECT n_base = (lane>>4)*4 + warp. The production
+// kernel src/fused/op_lds.hpp::async_copy_k_subtile now uses the same correct
+// formula (verify by diffing this loop against that function).
 
 constexpr int kKLdsRegionFloats = 8192; // golden dump per-slot stride (bf16 elems)
 

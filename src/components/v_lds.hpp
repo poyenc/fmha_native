@@ -2,6 +2,25 @@
 #include <hip/hip_runtime.h>
 #include <cstdint>
 
+// =============================================================================
+// COMPONENT (TEST-ONLY): V-LDS staging — pipeline STAGE 5 of 7.
+//
+// Standalone isolation of the "stage V into LDS" step, used ONLY by
+// tests/test_v_lds.cpp. Golden-verified, NOT #included by src/fused/.
+// CPU oracle: src/components_ref/ref_v_lds.{hpp,cpp}.
+//
+// WHY V needs a shuffle but K does not: GEMM1 contracts over seqk, so V must be
+// laid out in LDS with headdim as the row axis and seqk innermost. The DRAM
+// layout is the opposite, so each thread loads a 4x2 bf16 patch, transposes it
+// to 2x4 with two v_perm_b32 (a byte-permute), then ds_write2 the result into
+// the padded LDS slots. Unlike K (loaded via direct DRAM->LDS), V passes
+// through VGPRs because of this transpose.
+//
+// SCOPE: this component stages just ONE 32-row k1 slice (golden V_LDS dump
+// captures exactly that). The 72-element row stride in the offset formula is
+// 64 real headdim + 8 pad (kKPack) to avoid LDS bank conflicts.
+// =============================================================================
+//
 // Phase 1 Kernel 5 -- test_v_lds (V DRAM → shuffle → LDS staging)
 //
 // Reproduces CK's V load+repack+store path for ONE 32-row k1 slice,

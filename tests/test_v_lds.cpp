@@ -1,3 +1,14 @@
+// =============================================================================
+// UNIT TEST: V-LDS component (src/components/v_lds.hpp), pipeline STAGE 5.
+//
+// What it validates: the load + v_perm transpose + ds_write staging of one
+// 32-row V slice into LDS. HOW:
+//   1. MatchesCpuRef — kernel's dumped LDS vs ref_v_lds() image, BYTE exact.
+//   2. MatchesGolden — vs CK dump_lds.bin slot 1 (V_LDS, starts at float index
+//      8192). Compares only valid data slots. SKIPS without a golden dir.
+// V uses a distinct golden formula (v[i] = (i%256)/256 + 1) so V_LDS bugs can't
+// hide behind K's values.
+// =============================================================================
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
 #include <cstdint>

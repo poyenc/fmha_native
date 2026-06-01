@@ -1,3 +1,15 @@
+// =============================================================================
+// TEST: GPU reference vs CPU reference (oracle-vs-oracle, no production kernel).
+//
+// New here? The full-kernel test (test_fmha_fwd_d64.cpp) checks the production
+// kernel against the CPU reference, and separately uses the GPU reference to
+// verify LSE. This file exists to keep those two ORACLES honest with each
+// other: it runs gpu_ref_fmha_fwd (a naive fp32 attention kernel) and diffs it
+// against cpu_ref_verify across every kAllFull config. If both oracles agree,
+// we trust them as ground truth for the production kernel. Both follow the same
+// bf16-truncation pipeline, so the only slack is fp32 accumulation order.
+// =============================================================================
+//
 // GPU reference kernel correctness test.
 //
 // Verifies that the naive FP32 GPU reference kernel (gpu_ref_fmha_fwd)

@@ -1,9 +1,11 @@
 // Shared test infrastructure for FMHA Google Test binaries.
 //
-// TestCase defines a parameterized test configuration (problem dimensions
-// and feature flags).  make_params() converts a TestCase into a fully
-// normalized FmhaParams with derived fields populated.  test_name()
-// provides CamelCase names for gtest output.
+// This is the glue between the human-friendly config rows in test_configs.hpp
+// and the runner's FmhaParams. TestCase is the compact tuple you write by hand;
+// make_params() expands it into a fully normalized FmhaParams, filling in the
+// "0 means derive" defaults (kv_heads<-q_heads, gqa ratio, kv_seq_len, varlen
+// batch/seq from the per-batch length list). test_name() yields the CamelCase
+// label gtest prints for each parameterized instance.
 
 #pragma once
 #include "runner/fmha_params.hpp"

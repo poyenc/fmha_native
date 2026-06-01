@@ -1,6 +1,14 @@
 #pragma once
 #include <cstdint>
 
+// ===== REFERENCE ORACLE for the softmax component (src/components/softmax.hpp)
+// CPU truth for P/rmax/rsum. Unlike the full-kernel CPU references (which use
+// natural expf), THIS oracle mirrors the GPU exactly: it uses exp2f with the
+// same log2(e)-folded scale, so the comparison can be (near) bit-exact. The
+// cross-half merge is done by directly reading the partner thread (tid^32)
+// instead of a shuffle. Test-only oracle.
+// ============================================================================
+//
 // CPU reference for softmax (scale + mask + exp2 + rowsum + bf16 cast),
 // Phase 1 Kernel 4.
 //

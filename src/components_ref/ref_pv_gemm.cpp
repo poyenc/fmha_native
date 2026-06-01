@@ -1,7 +1,10 @@
 #include "components_ref/ref_pv_gemm.hpp"
 #include "runner/bf16_utils.hpp"
 
-// Extract P[m, n] from the P thread-buffer (TransposedC layout).
+// Invert the TransposedC layout to read logical P[m, n] out of the flat
+// thread-buffer p_acc[tid*32 + r]. n's low nibble decides the k_sub half (0..7
+// -> half 0, 8..15 -> half 1); n/16 picks the register group; m decides warp +
+// lane. This is the mirror image of the GPU's n_col formula.
 static float get_p(const float* p_acc, int m, int n) {
     int warp = m / 32;
     int lane_base = m % 32;

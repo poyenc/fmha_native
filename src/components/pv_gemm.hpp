@@ -2,6 +2,28 @@
 #include <hip/hip_runtime.h>
 #include <cstdint>
 
+// =============================================================================
+// COMPONENT (TEST-ONLY): GEMM1 (O = P * V) — pipeline STAGE 6 of 7.
+//
+// Standalone isolation of attention's second matmul, used ONLY by
+// tests/test_pv_gemm.cpp. Golden-verified, NOT #included by src/fused/.
+// CPU oracle: src/components_ref/ref_pv_gemm.{hpp,cpp}.
+//
+// CONTRAST WITH GEMM0 — read this if GEMM0 already makes sense:
+//   - Same CK convention (A=LDS, B=reg) and same HW arg swap, but here
+//     A = V (staged into LDS by the v_lds path inlined below) and B = P (the
+//     softmax output, already in registers from STAGE 4).
+//   - NO explicit SwizzleA on the V reads (bare hdim = lane%32). The swizzle
+//     "comes for free" because P is ALREADY in GEMM0's SwizzleA'd TransposedC
+//     layout, so the resulting O_acc lands in the correct distribution:
+//       m = (lane%32)+32*warp ,  d = swz((r/8)*16+(lane/32)*8+(r%8)).
+//   - Contraction is over seqk (0..63), so this kernel first stages TWO 32-row
+//     V slices into two LDS buffers (the inlined v_lds code), then runs 16 MFMA.
+//
+// P arrives as bf16-clean fp32 (low 16 bits zero); the loader repacks pairs of
+// P regs into dwords by taking their upper 16 bits.
+// =============================================================================
+//
 // Phase 1 Kernel 6 -- test_pv_gemm (GEMM1: P·V → O_acc)
 //
 // Reproduces CK's GEMM1 MFMA C-output (O_acc) bit-exact against golden

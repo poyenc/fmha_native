@@ -1,3 +1,14 @@
+// =============================================================================
+// UNIT TEST: epilogue component (src/components/epilog.hpp), pipeline STAGE 7.
+//
+// What it validates: O_final = O_acc / RSUM, bf16 store to DRAM. HOW:
+//   - CPU-ref tests chain ALL upstream refs (qk -> softmax -> pv) to build a
+//     realistic O_acc + RSUM (see compute_epilog_input), run the kernel, then
+//     diff o_final (tolerance: division rounding) and o_dram (EXACT bf16).
+//   - MatchesGolden uses golden O_acc (slot 5) + RSUM recomputed from golden
+//     S_ACC, diffing o_final vs slot 6 and o_dram vs the golden o_dram.bin.
+//     SKIPS without a golden dir.
+// =============================================================================
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
 #include <cstdint>

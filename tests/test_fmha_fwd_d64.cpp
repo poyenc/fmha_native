@@ -1,3 +1,20 @@
+// =============================================================================
+// TOP-LEVEL TEST: the PRODUCTION fused kernel (src/fused/), end to end.
+//
+// This is the integration counterpart to the 7 per-stage component tests. It
+// launches the real fmha_fwd_d64_bf16_msk{0,1}[_varlen] kernels and checks the
+// final O against references. Three groups:
+//   1. Smoke tests — hand-built cases for the softmax-only legacy path
+//      (DISABLED), BSHD strides, and BSHD + causal + GQA. Each carries its own
+//      inline natural-e (expf) CPU reference.
+//   2. Parameterized "Full" suite — every config in kAllFull (test_configs.hpp)
+//      run through cpu_ref_verify (and gpu_ref for LSE when enabled).
+//   3. Golden CK bit-match — fused O vs CK's o_dram.bin, 0 bf16 mismatches.
+//
+// NOTE on softmax domain: the CPU references HERE use natural expf and plain
+// 1/sqrt(d); the kernel uses base-2 exp2 with a log2(e)-folded scale. Same
+// probabilities, different arithmetic domain — do not "fix" one to match.
+// =============================================================================
 #include <gtest/gtest.h>
 #include "runner/gpu_ref.hpp"
 #include "runner/cpu_ref.hpp"

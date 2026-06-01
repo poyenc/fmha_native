@@ -1,6 +1,13 @@
 #pragma once
 #include <cstdint>
 
+// ===== REFERENCE ORACLE for the K-LDS component (src/components/k_lds.hpp) ===
+// The CPU truth-image for the staged K tile: it writes each in-range K element
+// to the exact LDS slot the GPU's swizzled copy should land it in, using the
+// same offset formula. The test then byte-compares the GPU's dumped LDS region
+// against this image. Test-only; never compiled into src/fused/.
+// ============================================================================
+//
 // CPU reference for the K-LDS staging layout (Phase 1 Kernel 1).
 //
 // Produces the expected LDS byte image (bf16) after K is staged from DRAM

@@ -1,6 +1,13 @@
 #pragma once
 #include <cstdint>
 
+// ===== REFERENCE ORACLE for the V-LDS component (src/components/v_lds.hpp) ===
+// CPU truth-image for the staged+transposed V tile. It writes each in-range V
+// element straight to its final LDS slot using the golden offset formula,
+// skipping the load/v_perm/ds_write dance the GPU performs — the END RESULT is
+// what matters for the byte comparison. Stages one 32-row k1 slice. Test-only.
+// ============================================================================
+//
 // CPU reference for V-LDS staging layout (Phase 1 Kernel 5).
 //
 // Produces the expected LDS byte image (bf16) after V is loaded from DRAM,

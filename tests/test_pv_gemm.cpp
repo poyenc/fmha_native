@@ -1,3 +1,14 @@
+// =============================================================================
+// UNIT TEST: GEMM1 component (src/components/pv_gemm.hpp), pipeline STAGE 6.
+//
+// What it validates: O_acc = P*V. HOW:
+//   - CPU-ref tests build a real P by chaining ref_qk_gemm -> ref_softmax
+//     (see compute_p), run the kernel, and diff vs ref_pv_gemm() with loose
+//     tolerance (MFMA vs CPU accumulation order).
+//   - MatchesGolden feeds golden P (slot 3) and diffs O_acc vs slot 5 EXACTLY
+//     (same golden P drives both, so the only variable is the GPU matmul).
+//     SKIPS without a golden dir.
+// =============================================================================
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
 #include <cstdint>

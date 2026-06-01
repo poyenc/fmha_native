@@ -1,3 +1,16 @@
+// =============================================================================
+// UNIT TEST: K-LDS component (src/components/k_lds.hpp), pipeline STAGE 1.
+//
+// What it validates: the GPU's swizzled DRAM->LDS K staging lands every element
+// in the right LDS slot. HOW:
+//   1. MatchesCpuRef — kernel's dumped LDS region vs ref_k_lds() image, BYTE
+//      exact (uint16 bf16 compare). Always runs.
+//   2. MatchesGolden — vs CK dump_lds.bin slot 0 (K_LDS), exact. Note the
+//      golden stores each bf16 widened to fp32 at index (bufferBase + offset),
+//      so the test compares only the real data slots, not the pad. SKIPS when
+//      no golden dir is given.
+// Edge cases (CPU-ref only) cover partial tiles where OOB rows must stay zero.
+// =============================================================================
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
 #include <cstdint>

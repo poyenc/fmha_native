@@ -1,6 +1,13 @@
 #pragma once
 #include <cstdint>
 
+// ===== REFERENCE ORACLE for the GEMM1 component (src/components/pv_gemm.hpp) ==
+// CPU truth for O_acc = P*V in the GPU's SwizzleA'd TransposedC output layout.
+// The tricky part is reading P: P is stored in the SAME TransposedC layout, so
+// to fetch logical element P[m,n] the .cpp must invert that mapping (see get_p).
+// O_acc here is RAW (not yet divided by rsum); the epilogue does that. Test-only.
+// ============================================================================
+//
 // CPU reference for GEMM1 (O = P * V), Phase 1 Kernel 6.
 //
 // Produces the expected O_acc thread-buffer image: out[tid*32 + r] for

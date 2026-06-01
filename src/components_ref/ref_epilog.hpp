@@ -1,6 +1,13 @@
 #pragma once
 #include <cstdint>
 
+// ===== REFERENCE ORACLE for the epilogue component (src/components/epilog.hpp)
+// CPU truth for the final output: divide O_acc by RSUM, truncate to bf16, and
+// scatter into row-major DRAM at the swz()-permuted column. Emits both the
+// pre-store normalized fp32 (o_final) and the bf16-promoted DRAM image
+// (o_dram) so the test can check each against its golden slot. Test-only.
+// ============================================================================
+//
 // CPU reference for Default2D epilogue, Phase 1 Kernel 7.
 //
 // Given O_acc (256×32 fp32) and RSUM (256 fp32):

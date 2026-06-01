@@ -1,6 +1,14 @@
 #pragma once
 #include <cstdint>
 
+// ===== REFERENCE ORACLE for the GEMM0 component (src/components/qk_gemm.hpp) =
+// New here? A "reference" is the CORRECTNESS ORACLE: a dead-simple CPU loop that
+// computes what the GPU component SHOULD produce, so the unit test can diff the
+// two. It deliberately avoids all MFMA/LDS tricks and just does the plain math
+// in the same thread-buffer (TransposedC) layout the GPU emits. Used only by
+// tests; never compiled into src/fused/.
+// ============================================================================
+//
 // CPU reference for GEMM0 (S = Q * K^T), Phase 1 Kernel 2.
 //
 // Produces the expected S_acc thread-buffer image: out[tid*32 + r] for

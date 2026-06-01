@@ -8,9 +8,9 @@
 #include <vector>
 
 #include "runner/bf16_utils.hpp"
-#include "refs/ref_pv_gemm.hpp"
-#include "refs/ref_qk_gemm.hpp"
-#include "refs/ref_softmax.hpp"
+#include "components_ref/ref_pv_gemm.hpp"
+#include "components_ref/ref_qk_gemm.hpp"
+#include "components_ref/ref_softmax.hpp"
 #include "kernels/pv_gemm.hpp"
 
 static std::string g_golden_full;

@@ -1,4 +1,4 @@
-#include "refs/ref_qk_gemm.hpp"
+#include "components_ref/ref_qk_gemm.hpp"
 #include "runner/bf16_utils.hpp"
 
 void ref_qk_gemm(const uint16_t* Q, int stride_q, int seqlen_q,

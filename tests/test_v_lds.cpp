@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "runner/bf16_utils.hpp"
-#include "refs/ref_v_lds.hpp"
+#include "components_ref/ref_v_lds.hpp"
 #include "kernels/v_lds.hpp"
 
 static std::string g_golden_full;

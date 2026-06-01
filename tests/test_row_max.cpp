@@ -8,8 +8,8 @@
 #include <vector>
 
 #include "runner/bf16_utils.hpp"
-#include "refs/ref_row_max.hpp"
-#include "refs/ref_qk_gemm.hpp"
+#include "components_ref/ref_row_max.hpp"
+#include "components_ref/ref_qk_gemm.hpp"
 #include "kernels/row_max.hpp"
 
 static std::string g_golden_full;

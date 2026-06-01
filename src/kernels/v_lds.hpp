@@ -26,7 +26,7 @@
 
 typedef int v2i __attribute__((ext_vector_type(2)));
 
-#include "refs/ref_v_lds.hpp"  // kVLdsRegionElems, kVLdsBufBase
+#include "components_ref/ref_v_lds.hpp"  // kVLdsRegionElems, kVLdsBufBase
 
 __device__ __forceinline__ __amdgpu_buffer_rsrc_t
 vlds_make_srd(const void* base) {

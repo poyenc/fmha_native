@@ -1,4 +1,4 @@
-#include "refs/ref_softmax.hpp"
+#include "components_ref/ref_softmax.hpp"
 #include "runner/bf16_utils.hpp"
 #include <cmath>
 #include <algorithm>

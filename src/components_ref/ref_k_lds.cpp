@@ -1,4 +1,4 @@
-#include "refs/ref_k_lds.hpp"
+#include "components_ref/ref_k_lds.hpp"
 #include <cstring>
 
 void ref_k_lds(const uint16_t* K,

@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "runner/bf16_utils.hpp"
-#include "refs/ref_k_lds.hpp"
+#include "components_ref/ref_k_lds.hpp"
 #include "kernels/k_lds.hpp"
 
 // Optional golden directory (set via --golden=<dir>). Empty => skip golden check.

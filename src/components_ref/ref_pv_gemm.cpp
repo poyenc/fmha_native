@@ -1,4 +1,4 @@
-#include "refs/ref_pv_gemm.hpp"
+#include "components_ref/ref_pv_gemm.hpp"
 #include "runner/bf16_utils.hpp"
 
 // Extract P[m, n] from the P thread-buffer (TransposedC layout).

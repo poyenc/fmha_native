@@ -44,6 +44,17 @@ __device__ __forceinline__ void softmax_mask(
         limit = (causal < limit) ? causal : limit;
     }
 
+    // Full-tile fast path: when the whole 64-column tile is in-bounds, no element
+    // is masked. Skipping it removes the per-iteration 32 v_cmp + 30 s_or + 32
+    // v_cndmask the compiler emits otherwise. The guard is wave-uniform so this is
+    // a single scalar branch. The boundary mask only does work on the last tile
+    // (and, for causal, the diagonal tiles), which still take the slow path.
+    if constexpr (!HasMask) {
+        // Max absolute column in this tile = kv_offset + 63 (k_sub=1, n1, off=23).
+        if (kv_offset + kN0 <= seqlen_k)
+            return;
+    }
+
     // Combined mask: 1 compare per element (no scale — deferred to exp)
     constexpr int offsets[16] = {0,1,2,3,4,5,6,7, 16,17,18,19,20,21,22,23};
     #pragma unroll

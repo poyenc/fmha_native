@@ -18,9 +18,9 @@
 //   2. Cross-half: 1 ds_bpermute with lane^32 merges the complementary half
 // NO butterfly needed.
 
-// ---- Scale + mask ----
+// ---- Mask ----
 //
-// Applies scaling (by scale_s_log2e) and masking to S_acc in-place.
+// Applies masking to S_acc in-place (scale deferred to exp).
 // Boundary mask: if n_col >= seqlen_k (absolute): -INFINITY
 // Causal mask: if n_col > m_row + shift: -INFINITY
 //
@@ -28,9 +28,8 @@
 //       = kv_offset + 32 + (i/8)*16 + k_sub*8 + (i%8)  [for n1 tile]
 
 template <bool HasMask>
-__device__ __forceinline__ void softmax_scale_and_mask(
+__device__ __forceinline__ void softmax_mask(
     v16f& s_acc_n0, v16f& s_acc_n1,
-    float scale_s_log2e,
     int seqlen_k,
     int kv_offset,
     int m_row,         // this thread's M-row index
@@ -45,16 +44,7 @@ __device__ __forceinline__ void softmax_scale_and_mask(
         limit = (causal < limit) ? causal : limit;
     }
 
-    // Scale via v_pk_mul_f32 (2 elements per instruction)
-    auto* pk0 = reinterpret_cast<__attribute__((ext_vector_type(2))) float*>(&s_acc_n0);
-    auto* pk1 = reinterpret_cast<__attribute__((ext_vector_type(2))) float*>(&s_acc_n1);
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        pk0[i] *= scale_s_log2e;
-        pk1[i] *= scale_s_log2e;
-    }
-
-    // Combined mask: 1 compare per element
+    // Combined mask: 1 compare per element (no scale — deferred to exp)
     constexpr int offsets[16] = {0,1,2,3,4,5,6,7, 16,17,18,19,20,21,22,23};
     #pragma unroll
     for (int i = 0; i < 16; i++) {
@@ -91,25 +81,21 @@ __device__ __forceinline__ float softmax_row_max(
     return fmaxf(local_max, other);
 }
 
-// ---- Exp2: P = exp2(S_scaled - row_max) ----
+// ---- Exp2: P = exp2(scale * S - scale * m_new) ----
 //
-// S_acc is already scaled (by scale_s_log2e) and masked.
-// Computes exp2(S - rmax) in-place. Masked values (-INFINITY) become 0.
-// From Phase 1 K4.
+// S_acc is unscaled (raw GEMM output) and masked (-INF for OOB).
+// Computes exp2(fmaf(scale, S, -scale_m)) in-place.
+// Compiler maps fmaf → v_fma_f32 (single 1-cycle VALU, guaranteed fused).
+// Masked values: fmaf(scale, -INF, -scale_m) = -INF → exp2(-INF) = 0.
 
 __device__ __forceinline__ void softmax_exp2(
     v16f& s_acc_n0, v16f& s_acc_n1,
-    float row_max)
+    float scale, float scale_m)
 {
     #pragma unroll
     for (int i = 0; i < 16; i++) {
-        if (row_max == -INFINITY) {
-            s_acc_n0[i] = 0.0f;
-            s_acc_n1[i] = 0.0f;
-        } else {
-            s_acc_n0[i] = __builtin_amdgcn_exp2f(s_acc_n0[i] - row_max);
-            s_acc_n1[i] = __builtin_amdgcn_exp2f(s_acc_n1[i] - row_max);
-        }
+        s_acc_n0[i] = __builtin_amdgcn_exp2f(fmaf(scale, s_acc_n0[i], -scale_m));
+        s_acc_n1[i] = __builtin_amdgcn_exp2f(fmaf(scale, s_acc_n1[i], -scale_m));
     }
 }
 

@@ -13,12 +13,14 @@
 // Store: 8 × buffer_store_dwordx2 (4 bf16 per store = 32 bf16 total).
 // bf16 truncation via v_perm_b32 (not RNE). Matches CK epilog pattern.
 //
-// LSE: log(rsum) + rmax / log2e. Stored to lse_base[m_row].
+// LSE: (log2(rsum) + scale*rmax) * ln(2). rmax is unscaled; apply scale here.
+// Stored to lse_base[m_row].
 
 __device__ __forceinline__ void epilog_store(
     v16f& o_acc_d0, v16f& o_acc_d1,
     float rsum,
     float rmax,
+    float scale,              // scale_s (log2e-based)
     int stride_o,             // in bf16 elements
     float* lse_base,
     int seqlen_q,
@@ -42,7 +44,7 @@ __device__ __forceinline__ void epilog_store(
     // Store LSE (raw pointer, unchanged from Phase 2)
     if (lse_base && k_sub == 0 && abs_m_row < seqlen_q) {
         float lse_val = (rsum > 0.0f)
-            ? (__builtin_amdgcn_logf(rsum) + rmax) * 0.6931471805599453f
+            ? (__builtin_amdgcn_logf(rsum) + scale * rmax) * 0.6931471805599453f
             : -INFINITY;
         lse_base[abs_m_row] = lse_val;
     }

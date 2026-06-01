@@ -100,7 +100,7 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
                     + static_cast<int64_t>(head_idx) * params.seqlen_q;
             }
         }
-        epilog_store(o_acc_d0, o_acc_d1, 0.0f, -INFINITY,
+        epilog_store(o_acc_d0, o_acc_d1, 0.0f, -INFINITY, params.scale,
                      params.stride_o, lse_base, seqlen_q, m_tile_idx, o_base);
         return;
     }
@@ -166,10 +166,10 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             gemm0_subtile(s_acc_n0, s_acc_n1, slice_q(q_regs, 1), lds, LdsSeq[1]);
             __builtin_amdgcn_sched_barrier(0x1); // CK barrier 4 — GEMM0 exit, VALU-only
 
-            // Softmax scale+mask + row_max
-            float scale_s_log2e = params.scale;
-            softmax_scale_and_mask<HasMask>(s_acc_n0, s_acc_n1, scale_s_log2e,
-                                            seqlen_k, kv_offset, abs_m_row, mask_shift);
+            // Softmax mask + row_max (scale deferred to exp)
+            float scale_s = params.scale;
+            softmax_mask<HasMask>(s_acc_n0, s_acc_n1,
+                                  seqlen_k, kv_offset, abs_m_row, mask_shift);
             float m_new = softmax_row_max(s_acc_n0, s_acc_n1, rmax);
             __builtin_amdgcn_sched_barrier(0x7F); // CK barrier 5 — after bpermute, all non-MFMA
 
@@ -184,10 +184,11 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
 
             // Softmax exp + sum + rescale + pack + GEMM1
             // All in one scheduling region so compiler can interleave with MFMA
-            softmax_exp2(s_acc_n0, s_acc_n1, m_new);
+            float scale_m = scale_s * m_new;
+            softmax_exp2(s_acc_n0, s_acc_n1, scale_s, scale_m);
             float l_new = softmax_row_sum(s_acc_n0, s_acc_n1);
 
-            float rescale = __builtin_amdgcn_exp2f(rmax - m_new);
+            float rescale = __builtin_amdgcn_exp2f(scale_s * (rmax - m_new));
             rescale_o_acc(o_acc_d0, o_acc_d1, rescale);
             rsum = rescale * rsum + l_new;
             rmax = m_new;
@@ -234,6 +235,6 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
         }
     }
 
-    epilog_store(o_acc_d0, o_acc_d1, rsum, rmax,
+    epilog_store(o_acc_d0, o_acc_d1, rsum, rmax, params.scale,
                  params.stride_o, lse_base, seqlen_q, m_tile_idx, o_base);
 }

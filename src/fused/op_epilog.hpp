@@ -26,9 +26,9 @@
 // Store: 8 × buffer_store_dwordx2 (4 bf16 per store = 32 bf16 total).
 // bf16 truncation via v_perm_b32 (not RNE). Matches CK epilog pattern.
 //
-// LSE: (logf(rsum) + scale*rmax) * ln(2). rmax is unscaled (scale applied here);
-// note logf(rsum) is natural log while scale*rmax is exp2-domain — see the
-// per-line note at the computation for the domain caveat. Stored to lse_base[m_row].
+// LSE: (log2(rsum) + scale*rmax) * ln(2) == ln(rsum) + sm_scale*rmax. Both terms
+// are base-2 (amdgcn_logf -> v_log_f32 IS log2, like exp2 elsewhere); rmax is
+// unscaled (scale applied here). Stored to lse_base[m_row].
 //
 // epilog_store: normalize + bf16-truncate + buffer_store one M-tile of O, plus
 // the optional LSE row. Distribution assumptions: O_acc is in the TransposedC
@@ -76,16 +76,17 @@ __device__ __forceinline__ void epilog_store(
     // the whole row was masked (e.g. fully out of causal range) -> emit zeros.
     float inv_sum = (rsum > 0.0f) ? 1.0f / rsum : 0.0f;
 
-    // Log-sum-exp for this row, computed as (logf(rsum) + scale*rmax) * ln(2).
-    //   - rmax is the UNSCALED running max; `scale` (log2e-based) puts scale*rmax
-    //     in the exp2 domain, then *ln(2) converts that term to natural units
-    //     (scale*rmax*ln(2) == sm_scale*rmax, the natural-domain max term).
-    //   - rsum is a plain probability sum (denominator of softmax), so logf(rsum)
-    //     is ALREADY natural log. Note the *ln(2) therefore also multiplies this
-    //     term — i.e. the two terms are NOT in the same domain before the scale.
-    //     This matches the kernel's chosen LSE output convention; if you ever need
-    //     strict natural-log LSE parity with a reference, check this factor against
-    //     the CK definition rather than trusting this line.
+    // Log-sum-exp for this row, computed as (log2(rsum) + scale*rmax) * ln(2),
+    // which equals the natural-log LSE  ln(rsum_nat) + sm_scale*rmax. The whole
+    // softmax runs in base-2: __builtin_amdgcn_logf emits v_log_f32 = LOG2 (not
+    // natural log), matching the v_exp_f32 / exp2 used everywhere else.
+    //   - rsum = Σ exp2(scale*(S - rmax)), so log2(rsum) is the base-2 log of the
+    //     denominator; scale*rmax (scale is log2e-based) is also base-2. Both terms
+    //     are in the SAME base-2 domain.
+    //   - rmax is the UNSCALED running max; `scale` is applied here.
+    //   - the trailing *ln(2) converts the summed base-2 quantity to natural units
+    //     in one step (log2(x)*ln(2) == ln(x); scale*ln(2) == sm_scale), the
+    //     convention the LSE output expects.
     // Only k_sub==0 writes — the other half holds the identical reduced value and
     // would just clobber the same address. Fully-masked rows -> -INF.
     if (lse_base && k_sub == 0 && abs_m_row < seqlen_q) {

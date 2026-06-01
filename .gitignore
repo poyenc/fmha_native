@@ -1,8 +1,11 @@
 .claude/
-docs/
 build/
 build2/
 build_qa/
 workloads/
 .rocprofv3/
 native_d64_kernel.s
+
+# docs/ is tracked, EXCEPT working scratch (specs/plans are deleted after execution)
+docs/superpowers/
+docs/isa-rewrite-spec.md

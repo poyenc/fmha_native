@@ -4,7 +4,7 @@
 # /root/workspace. Example:
 #   docker exec poyenc-fmha bash -c "/root/workspace/scripts/run-gates.sh"
 #
-# G2 bar: 60/60 fused (build/test_fmha_fwd_d64) + 49/49 standalone
+# G2 bar: 67/67 fused (build/test_fmha_fwd_d64) + 49/49 standalone
 # (7 suites x 7 tests) using the golden dumps. Golden dirs default to
 # /tmp/fmha-native-isa-match/golden/{full,partial} (already staged in
 # poyenc-fmha). Without golden, the MatchesGolden cases GTEST_SKIP and the
@@ -37,10 +37,10 @@ Options:
 
 Gates:
   g1  Build the fmha_kernel target.
-  g2  Run fused (60/60) + 7 standalone suites with golden (49/49). Fails on any
+  g2  Run fused (67/67) + 7 standalone suites with golden (49/49). Fails on any
       failure, skip, or missing golden dir.
-  g3  Rebuild and copy fmha_fwd_d64_kernel.cpp.s to <repo>/native_d64_kernel.s
-      for /amdgpu-asm-analyzer.
+  g3  Rebuild and copy the kernel's generated .s (kernel.cpp -> kernel-hip-...gfx942.s)
+      to <repo>/native_d64_kernel.s for assembly comparison.
 USAGE
     exit 0
 }
@@ -100,7 +100,7 @@ run_gtest() {
 }
 
 gate_g2() {
-    echo "=== G2: tests (fused 60/60 + standalone 49/49 via golden) ==="
+    echo "=== G2: tests (fused 67/67 + standalone 49/49 via golden) ==="
     [ -f "${GOLDEN_FULL}/dump_lds.bin" ]    || fail "G2 missing golden full: ${GOLDEN_FULL}"
     [ -f "${GOLDEN_PARTIAL}/dump_lds.bin" ] || fail "G2 missing golden partial: ${GOLDEN_PARTIAL}"
 

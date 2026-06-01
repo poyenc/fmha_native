@@ -44,7 +44,6 @@ target_include_directories(fmha_kernel PUBLIC src)
 target_link_libraries(fmha_kernel PUBLIC hip::device)
 target_compile_options(fmha_kernel PRIVATE
     --offload-arch=${GPU_TARGET} --save-temps
-    -DCK_TILE_FMHA_FWD_FAST_EXP2=1
     "SHELL:-mllvm -amdgpu-early-inline-all=true"
     "SHELL:-mllvm -amdgpu-function-calls=false"
     "SHELL:-mllvm --lsr-drop-solution=1"

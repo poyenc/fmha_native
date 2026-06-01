@@ -220,7 +220,10 @@ int main(int argc, char** argv) {
     float t_avg = t_sum / cfg.iters;
 
     // TFLOPS: 2 * B * H * Sq * Sk * D * 2 (Q*K and P*V GEMMs, multiply-add)
+    // Causal mask computes ~half the Sq*Sk area, so halve the FLOP count to
+    // match CK's convention (CK scales by mask.get_unmaskarea()).
     double flops = 4.0 * p.batch * p.q_heads * (double)p.seq_len * p.kv_seq_len * p.head_dim;
+    if (p.mask) flops *= 0.5;
     double tflops_avg = flops / (t_avg * 1e-3) / 1e12;
     double tflops_min = flops / (t_min * 1e-3) / 1e12;
 

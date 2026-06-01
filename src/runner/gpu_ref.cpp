@@ -5,23 +5,34 @@
 #include <hip/hip_runtime.h>
 #include <cmath>
 
+// One thread = one output row (one query position).  The grid is FLAT 1D:
+// total_rows threads laid out as [batch, q_heads, seq_len], unlike the fused
+// kernel's 3D grid (q_heads, m_tiles, batch) which assigns a 128-row M-tile to
+// each threadblock.  This naive form trades all of that tiling for readability.
 __global__ void gpu_ref_fmha_kernel(GpuRefParams p) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int total_rows = p.batch * p.q_heads * p.seq_len;
     if (tid >= total_rows) return;
 
+    // Decode the flat thread id into (batch, query-head, query-row).
     const int b  = tid / (p.q_heads * p.seq_len);
     const int hq = (tid / p.seq_len) % p.q_heads;
     const int i  = tid % p.seq_len;
+    // GQA: several query heads share one KV head.
     const int hkv = hq / p.gqa;
 
     const int D = p.head_dim;
 
+    // Default (fixed-length batch) addressing: query row i within this batch's
+    // full sequence; keys start at 0.  Overridden below in varlen mode.
     int i_q = i;
     int i_k = 0;
     int Sq_b = p.seq_len;
     int Skv_b = p.kv_seq_len;
 
+    // Varlen/group mode: the cumulative offset tables give this batch's slice
+    // [seqstart[b], seqstart[b+1]) inside the packed Q/K/V tensors.  Threads
+    // whose row index exceeds this batch's true length exit early.
     if (p.d_seqstart_q) {
         uint32_t qstart = p.d_seqstart_q[b];
         Sq_b = p.d_seqstart_q[b + 1] - qstart;
@@ -38,6 +49,7 @@ __global__ void gpu_ref_fmha_kernel(GpuRefParams p) {
     const uint16_t* V_base = p.d_V + (size_t)b * p.stride_v_batch + (size_t)hkv * p.stride_v_head + (size_t)i_k * p.stride_v_seq;
     uint16_t*       O_row  = p.d_O + (size_t)b * p.stride_o_batch + (size_t)hq  * p.stride_o_head + (size_t)i_q * p.stride_o_seq;
 
+    // Pass 1: scan all keys to find the row max (for stable softmax).
     float max_s = -INFINITY;
     for (int j = 0; j < Skv_b; j++) {
         float s = 0;
@@ -51,6 +63,8 @@ __global__ void gpu_ref_fmha_kernel(GpuRefParams p) {
         if (s > max_s) max_s = s;
     }
 
+    // Pass 2: re-scan to accumulate the softmax denominator sum(exp(s - max)).
+    // Scores are recomputed rather than cached to keep per-thread state tiny.
     float sum_exp = 0;
     for (int j = 0; j < Skv_b; j++) {
         float s = 0;
@@ -67,9 +81,11 @@ __global__ void gpu_ref_fmha_kernel(GpuRefParams p) {
 
     float inv_sum = (sum_exp > 0) ? 1.0f / sum_exp : 0.0f;
 
+    // O_acc holds this row's output; D <= 256 is guaranteed by the dispatch.
     float O_acc[256];
     for (int d = 0; d < D; d++) O_acc[d] = 0;
 
+    // Pass 3: recompute probabilities and accumulate O += P * V.
     for (int j = 0; j < Skv_b; j++) {
         float s = 0;
         for (int d = 0; d < D; d++) {
@@ -81,6 +97,8 @@ __global__ void gpu_ref_fmha_kernel(GpuRefParams p) {
         if (p.mask && j > i + (Skv_b - Sq_b)) s = -INFINITY;
         float p_val = ((s == -INFINITY) ? 0.0f : expf(s - max_s)) * inv_sum;
 
+        // Truncate P to BF16 and widen back, matching the optimized kernel's
+        // P.V GEMM input precision (and the CPU reference).
         uint16_t p_bf16 = float_to_bf16(p_val);
         float p_trunc = bf16_to_float(p_bf16);
 
@@ -94,8 +112,12 @@ __global__ void gpu_ref_fmha_kernel(GpuRefParams p) {
         O_row[d] = float_to_bf16(O_acc[d]);
     }
 
+    // Optional log-sum-exp: log(sum exp(s - max)) + max recovers log(sum exp(s)).
     if (p.d_LSE) {
         float lse_val = (sum_exp > 0) ? logf(sum_exp) + max_s : -INFINITY;
+        // LSE is packed [batch, q_heads, seqlen] with no head_dim; recover the
+        // per-row strides by dividing the Q element strides by the per-token
+        // stride (Q's stride_q_seq == head_dim for contiguous tensors).
         size_t lse_idx = (size_t)b * (p.stride_q_batch / p.stride_q_seq)
                        + (size_t)hq * (p.stride_q_head / p.stride_q_seq)
                        + i_q;

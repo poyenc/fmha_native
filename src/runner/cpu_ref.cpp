@@ -100,6 +100,10 @@ CpuRefResult cpu_ref_verify(const FmhaParams& p, const FmhaBuffers& bufs) {
                 O_off  = (((size_t)b * Hq  + hq ) * Sq  + i) * Dpad;
             }
 
+            // Scores S = (Q . K^T) * scalar, one row of the attention matrix.
+            // Here scalar is the PLAIN 1/sqrt(head_dim) and softmax below is
+            // natural-e (expf) — the log2(e) trick lives only in the GPU kernel,
+            // which uses exp2; both produce the same probabilities.
             for (int j = 0; j < Skv_b; j++) {
                 float s = 0;
                 for (int d = 0; d < Dlog; d++) {
@@ -108,14 +112,20 @@ CpuRefResult cpu_ref_verify(const FmhaParams& p, const FmhaBuffers& bufs) {
                     s += q * k;
                 }
                 S[j] = s * scalar;
+                // Right-aligned causal mask (FA-2 / CK convention): query row i
+                // may attend key j only up to i + (Skv_b - Sq_b); the
+                // (Skv_b - Sq_b) shift aligns the diagonal when k and q lengths
+                // differ.  Masked positions are set to -inf so exp() -> 0.
                 const int Sq_b = get_sq(b);
                 if (p.mask && j > i + (Skv_b - Sq_b)) S[j] = -INFINITY;
             }
 
+            // Numerically-stable softmax: subtract the row max before exp.
             float m = S[0];
             for (int j = 1; j < Skv_b; j++) if (S[j] > m) m = S[j];
 
             if (m == -INFINITY) {
+                // Entire row masked out (can happen with causal masking); P = 0.
                 for (int j = 0; j < Skv_b; j++) P[j] = 0.0f;
             } else {
                 float sum = 0;
@@ -126,6 +136,9 @@ CpuRefResult cpu_ref_verify(const FmhaParams& p, const FmhaBuffers& bufs) {
                 float inv_sum = 1.0f / sum;
                 for (int j = 0; j < Skv_b; j++) {
                     P[j] *= inv_sum;
+                    // Emulate the kernel data path: P is truncated to BF16 and
+                    // widened back before the P.V GEMM (see file header step 3),
+                    // so the reference sees the same rounding as the shader.
                     P[j] = bf16_to_float(float_to_bf16(P[j]));
                 }
             }

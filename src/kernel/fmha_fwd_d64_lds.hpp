@@ -73,14 +73,6 @@ __device__ __forceinline__ int buf_base_bytes(int buf_idx) {
     return buf_idx * 4608;
 }
 
-// K/V LDS element offset (padded layout, single-buffer relative).
-// Verified in Phase 0/1:
-//   offset(j,d) = (j%4)*136 + ((j/4)%4)*32 + (j/16)*544 + (d%32) + (d/32)*2304
-__device__ __forceinline__ int k_lds_elem_offset(int j, int d) {
-    return (j % 4) * 136 + ((j / 4) % 4) * 32 + (j / 16) * 544
-         + (d % 32) + (d / 32) * 2304;
-}
-
 // ---- K async copy to LDS (DRAM→LDS, bypasses VGPRs) ----
 //
 // Uses __builtin_amdgcn_raw_ptr_buffer_load_lds for direct DRAM-to-LDS

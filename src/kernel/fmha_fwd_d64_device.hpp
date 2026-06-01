@@ -178,7 +178,10 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             store_v_to_lds(v_k3_0, v_k3_1, lds, LdsSeq[2]);
             v2i v1_k3_0, v1_k3_1;
             load_v_from_dram(v1_k3_0, v1_k3_1, srd_v, params.stride_v, kv_offset + 32);
-            s_waitcnt_vmcnt_0();
+            // v1 load left in flight: its only consumer is store_v_to_lds at the
+            // end of GEMM1 (already guarded by s_waitcnt_vmcnt_0 there). Draining
+            // here would expose the V-load HBM latency instead of overlapping it
+            // with the exp2 / row_sum / rescale / GEMM1 compute that follows.
 
             __builtin_amdgcn_sched_barrier(0); // CK barrier 6 — after V-staging, before O-rescale + GEMM1
 

@@ -6,27 +6,116 @@
 #include "op_softmax.hpp"
 #include "op_epilog.hpp"
 
+// ================================================================
+// pipeline.hpp — the per-block forward pass (heart of the kernel)
+// ================================================================
+//
+// ROLE IN THE PIPELINE
+//   fmha_fwd_d64_device<HasMask,IsVarlen> IS the whole FMHA forward pass for one
+//   M-tile (kM0=128 query rows of one batch/head). kernel.cpp's four __global__
+//   entries are thin shells that decode blockIdx and call this. Everything below
+//   orchestrates the helpers in op_lds.hpp / op_gemm.hpp / op_softmax.hpp /
+//   op_epilog.hpp into a software-pipelined loop over the KV tiles.
+//
+// END-TO-END FLOW (one block):
+//   1. SETUP   — decode lane/warp geometry; resolve Q/K/V/O base pointers and
+//                seqlens for dense vs varlen; build buffer SRDs; derive the causal
+//                loop bound (seqlen_k_end).
+//   2. Q LOAD  — each thread loads its slice of the 128xkHeadDim Q tile into
+//                registers ONCE (q_regs[4]); Q is reused for every KV tile.
+//   3. PROLOGUE— issue the first K sub-tile async copy into LDS so GEMM0 of the
+//                first iteration has data to read.
+//   4. TILE LOOP over KV tiles (kN0=64 keys each):
+//        GEMM0   S_acc = Q . K^T          (op_gemm: reads K from LDS, Q from reg)
+//        SOFTMAX mask -> row_max -> exp2 -> row_sum  (online; op_softmax)
+//        V STAGE DRAM -> regs -> v_perm shuffle -> LDS   (op_lds)
+//        ONLINE  rescale carried O_acc by exp2(scale*(old_max-new_max)) when the
+//                running max grew this tile; correct the running sum likewise
+//        GEMM1   O_acc += P . V           (op_gemm: reads V from LDS, P from reg)
+//      All while prefetching the NEXT tile's K copy and the second V half so HBM
+//      latency overlaps compute.
+//   5. EPILOGUE— normalize O_acc by the final row sum, bf16-truncate, store O to
+//                DRAM, optionally write LSE (op_epilog).
+//
+// ONLINE SOFTMAX (Milakov), carried across tiles in three scalars per row:
+//     rmax — running max of scaled scores seen so far (seed -5000 ~ -inf)
+//     rsum — running denominator (sum of exp2 probabilities)
+//     o_acc_d0/d1 — running numerator (sum of P.V), in TransposedC layout
+//   When a tile raises the max from rmax to m_new, every earlier contribution is
+//   too large by exp2(scale*(rmax-m_new)); we rescale o_acc and rsum by that
+//   factor BEFORE adding this tile, so the result equals a single global softmax.
+//
+// LDS DOUBLE/TRIPLE BUFFERING via LdsSeq[] — see the constant's comment below.
+//
+// sched_barrier() CALLS: the __builtin_amdgcn_sched_barrier(mask) calls scattered
+//   through the loop mirror CK's barrier structure one-for-one. Their PURPOSE here
+//   is codegen/parity: pinning the compiler's instruction scheduling to match CK's
+//   so the generated ISA (and thus numerics/behavior) lines up — a CORRECTNESS /
+//   parity goal, not a perf lever. VERIFIED: barrier-for-barrier matching by
+//   itself moved performance ~0%. The mask argument restricts what the scheduler
+//   may move across the barrier (0 = full barrier / no reordering across it;
+//   0x1, 0x7, 0x7F = progressively allow only certain instruction classes, used
+//   to fence MFMA vs VALU regions exactly as CK does). Do not read them as a
+//   tuning knob.
+//
+// THREAD GEOMETRY (shared with the op_*.hpp files):
+//   warp_id = threadIdx.x>>6 (0..3); lane_id = threadIdx.x&63 (0..63);
+//   k_sub = lane_id>>5 (0/1, the 32-lane half); m_row = (lane_id&31)+32*warp_id
+//   is this lane's query row within the M-tile (TransposedC: one M-row per lane).
+
+// Build an untyped byte buffer SRD over a DRAM tensor base. num_records is left
+// at 0xFFFFFFFF (max) so the hardware bounds-check never trips on in-range
+// accesses; 0x00027000 is the CDNA data-format word for a raw byte buffer used by
+// the raw_buffer_load builtins. Per-access bounds come from the byte voffset the
+// callers compute.
 __device__ __forceinline__ __amdgpu_buffer_rsrc_t make_buffer_resource(const void* base) {
     return __builtin_amdgcn_make_buffer_rsrc(
         const_cast<void*>(base), 0, 0xFFFFFFFF, 0x00027000);
 }
 
+// LDS buffer rotation for the four staging slots used within one tile iteration.
+// The kernel runs a 3-buffer rotating LDS scheme (op_lds.hpp: buf_idx in {0,1,2}).
+// LdsSeq encodes which physical buffer each logical slot of a tile maps to:
+//   LdsSeq[0] = K sub-tile 0 (consumed by GEMM0 sub-tile 0, and where the NEXT
+//               tile's prefetched K lands)
+//   LdsSeq[1] = K sub-tile 1 (consumed by GEMM0 sub-tile 1)
+//   LdsSeq[2] = V half 0     (staged for GEMM1 sub-tile 0)
+//   LdsSeq[3] = V half 1     (staged for GEMM1 sub-tile 1)
+// The values {1,2,1,0} keep the K tile being read by GEMM0 in a different physical
+// buffer from the V tile being written for GEMM1, so producer and consumer never
+// alias the same buffer within an iteration (the reuse of buffer 1 for both K
+// halves is safe because GEMM0 finishes sub-tile 0 before sub-tile 1 is needed).
 constexpr int LdsSeq[4] = {1, 2, 1, 0};
 
+// One block's full FMHA forward pass over its M-tile.
+//   HasMask  : compile-time. false = boundary mask only; true = causal+boundary.
+//   IsVarlen : compile-time. false = dense batch tensors; true = group/varlen.
+//   params   : tensor pointers, strides, scale, optional LSE/seqstart arrays.
+//   lds      : this block's __shared__ scratch (kLdsBytes; the 3 rotating buffers).
+//   batch_idx/head_idx/m_tile_idx : the tile coordinates (from blockIdx; the
+//                                   causal M-tile reversal already applied in
+//                                   kernel.cpp for the masked entries).
 template <bool HasMask, bool IsVarlen>
 __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
                                     char* lds,
                                     int batch_idx,
                                     int head_idx,
                                     int m_tile_idx) {
+    // ---- Thread geometry (TransposedC; see file header / op_gemm.hpp) ----
     const int lane_id = threadIdx.x & 63;
     const int warp_id = threadIdx.x >> 6;
-    const int k_sub   = lane_id >> 5;
-    const int m_row   = (lane_id & 31) + 32 * warp_id;
+    const int k_sub   = lane_id >> 5;                  // 32-lane half (0/1)
+    const int m_row   = (lane_id & 31) + 32 * warp_id; // this lane's query row in tile
 
+    // GQA/MQA: several Q heads can share one K/V head. Map this Q head to its KV
+    // head (nhead_ratio==1 for full MHA).
     const int nhead_ratio = params.nhead_q / params.nhead_k;
     const int kv_head_idx = head_idx / nhead_ratio;
 
+    // ---- Resolve per-sequence lengths and the row offset into the tensors ----
+    // Varlen (group mode): sequences are packed back-to-back; seqstart_*[b] is the
+    // running row offset and the length is the gap to the next start. Dense mode
+    // uses uniform seqlens and addresses by batch stride later.
     int seqlen_q, seqlen_k;
     int offset_q = 0, offset_k = 0;
     if constexpr (IsVarlen) {
@@ -34,12 +123,18 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
         offset_k = params.seqstart_k[batch_idx];
         seqlen_q = params.seqstart_q[batch_idx + 1] - offset_q;
         seqlen_k = params.seqstart_k[batch_idx + 1] - offset_k;
+        // This M-tile starts past the end of this (short) sequence: nothing to do.
+        // Cheap early-out; dense mode cannot hit it (m_tiles sized to seqlen_q).
         if (m_tile_idx * kM0 >= seqlen_q) return;
     } else {
         seqlen_q = params.seqlen_q;
         seqlen_k = params.seqlen_k;
     }
 
+    // ---- Base pointers for this (batch, head) ----
+    // Varlen indexes rows via offset_* (no batch stride; sequences are packed).
+    // Dense indexes via batch_stride_* then nhead_stride_*. K/V use kv_head_idx
+    // (GQA); Q/O use the full head_idx. int64 math avoids overflow on big tensors.
     const __hip_bfloat16* q_base;
     const __hip_bfloat16* k_base;
     const __hip_bfloat16* v_base;
@@ -64,15 +159,30 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
                            + static_cast<int64_t>(head_idx)  * params.nhead_stride_o;
     }
 
+    // Buffer SRDs the raw_buffer_load builtins read through (O's SRD is built
+    // separately inside the epilogue).
     auto srd_q = make_buffer_resource(q_base);
     auto srd_k = make_buffer_resource(k_base);
     auto srd_v = make_buffer_resource(v_base);
 
+    // ---- KV loop bounds ----
+    // mask_shift aligns the causal diagonal when seqlen_k != seqlen_q: query row r
+    // may attend keys with column <= r + mask_shift (CK convention: the last query
+    // attends the last key). Non-causal walks all of seqlen_k.
     int seqlen_k_start = 0;
     int seqlen_k_end   = seqlen_k;
     int mask_shift = seqlen_k - seqlen_q;
 
     if constexpr (HasMask) {
+        // Causal: skip every KV tile that lies entirely PAST this M-tile's
+        // diagonal (those keys are all masked, so they'd add nothing). Derivation:
+        //   last_q_row  = highest query row this M-tile owns (clamped to seqlen_q)
+        //   raw_end     = last column that row may attend = last_q_row+mask_shift+1
+        //   seqlen_k_end= raw_end rounded UP to a whole kN0 tile (so the diagonal
+        //                 tile itself is still processed; softmax_mask handles the
+        //                 partial masking within it), clamped to seqlen_k.
+        // Combined with the heavy-first M-tile reversal in kernel.cpp, this is what
+        // makes causal cost ~linear in m_tile.
         int last_q_row = m_tile_idx * kM0 + kM0 - 1;
         if (last_q_row >= seqlen_q) last_q_row = seqlen_q - 1;
         int raw_end = last_q_row + mask_shift + 1;
@@ -82,12 +192,18 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
         seqlen_k_start = 0;
     }
 
+    // Number of kN0(=64)-key tiles this block walks.
     int num_total_loop = (seqlen_k_end - seqlen_k_start + kN0 - 1) / kN0;
 
+    // O accumulator (numerator of online softmax): two kHeadDim/2 halves in the
+    // TransposedC layout, carried across all KV tiles. Start at zero.
     v16f o_acc_d0, o_acc_d1;
     clear_acc(o_acc_d0);
     clear_acc(o_acc_d1);
 
+    // Degenerate tile (e.g. a causal M-tile whose every key is masked, or a varlen
+    // tail): no KV work. Emit a zeroed O row with LSE=-inf and return. The LSE base
+    // resolution mirrors the epilogue's (kept inline to avoid carrying it down).
     if (num_total_loop <= 0) {
         float* lse_base = nullptr;
         if (params.lse) {
@@ -105,9 +221,16 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
         return;
     }
 
+    // ---- Q LOAD (once; reused for every KV tile) ----
+    // This lane's absolute query row, and Q's row stride in bytes.
     const int abs_m_row = m_tile_idx * kM0 + m_row;
     const int q_stride_bytes = params.stride_q * 2;
 
+    // Load this lane's full kHeadDim(=64) Q slice as 4x b128 (4 dwords = 8 bf16
+    // each). Per the TransposedC mapping, this lane owns headdim
+    // hd = kstep*16 + k_sub*8 + (0..7) in q_regs[kstep]; slice_q() (op_gemm.hpp)
+    // hands the right pair of these to each GEMM0 sub-tile. Out-of-range query rows
+    // (the last M-tile's padding) load zeros so masked rows contribute nothing.
     v4i q_regs[4];
     if (abs_m_row < seqlen_q) {
         #pragma unroll
@@ -122,32 +245,42 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             q_regs[kstep] = v4i{0, 0, 0, 0};
     }
 
+    // Online-softmax running state for this lane's row. rmax seeded well below any
+    // real score (-5000, not -inf, so the first fmax/rescale stay finite). rsum
+    // starts empty.
     float rmax = -5000.0f;
     float rsum = 0.0f;
 
+    // kv_offset = absolute key row of the current tile's first key.
+    // k_col_offset = which kK0(=32) headdim half of K to stage next (0 then 32).
     int kv_offset = seqlen_k_start;
     int k_col_offset = 0;
 
-    // After Q load, before K prefetch — match CK prologue barriers 1-2
+    // After Q load, before K prefetch — match CK prologue barriers 1-2.
+    // (sched_barriers are codegen/parity fences, ~0% perf — see file header.)
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_sched_barrier(0);
 
-    // PROLOGUE
+    // ---- PROLOGUE: kick off the first K sub-tile copy (headdim half 0) so the
+    // first GEMM0 has data. Async (vmcnt only); the loop fences it before reading.
     async_copy_k_subtile(lds, srd_k, params.stride_k, kv_offset, k_col_offset, LdsSeq[0]);
     k_col_offset += kK0;
 
     __builtin_amdgcn_sched_barrier(0); // prologue barrier 3
 
-    // TILE LOOP
+    // ================= TILE LOOP over KV tiles =================
     int i_total_loops = 0;
     __builtin_amdgcn_sched_barrier(0); // prologue barrier 4
     do {
-        // GEMM0
+        // ---- GEMM0: S_acc = Q . K^T for this tile (two 32-wide N halves) ----
         v16f s_acc_n0, s_acc_n1;
         clear_acc(s_acc_n0);
         clear_acc(s_acc_n1);
 
         {
+            // Prefetch K headdim half 1 (buffer LdsSeq[1]) while half 0 is still
+            // in flight, then drain to <=4 outstanding and barrier so half 0 is
+            // visible, and run GEMM0 sub-tile 0 (consumes half 0 from LdsSeq[0]).
             async_copy_k_subtile(lds, srd_k, params.stride_k, kv_offset, k_col_offset, LdsSeq[1]);
             k_col_offset += kK0;
             async_load_fence(4);
@@ -157,6 +290,9 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
         }
 
         {
+            // Drain K half 1 and barrier so it is visible, then start V loading
+            // from DRAM into registers (overlapping GEMM0 sub-tile 1's MFMA) and
+            // run GEMM0 sub-tile 1 (consumes half 1 from LdsSeq[1]) to finish S_acc.
             async_load_fence(0);
             s_barrier();
             __builtin_amdgcn_sched_barrier(0); // CK barrier 2 — after s_barrier, before V-load + GEMM0.1
@@ -166,7 +302,12 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             gemm0_subtile(s_acc_n0, s_acc_n1, slice_q(q_regs, 1), lds, LdsSeq[1]);
             __builtin_amdgcn_sched_barrier(0x1); // CK barrier 4 — GEMM0 exit, VALU-only
 
-            // Softmax mask + row_max (scale deferred to exp)
+            // ---- SOFTMAX part 1: mask + running row max ----
+            // scale is deferred: GEMM0 emitted RAW scores; mask/max work in raw
+            // units and the scale is fused into the exp2 below (see op_softmax.hpp).
+            // softmax_mask sets out-of-bounds / causal-future entries to -INF.
+            // softmax_row_max folds this tile's masked scores into the running rmax,
+            // returning the new per-row max m_new (>= rmax).
             float scale_s = params.scale;
             softmax_mask<HasMask>(s_acc_n0, s_acc_n1,
                                   seqlen_k, kv_offset, abs_m_row, mask_shift,
@@ -174,7 +315,10 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             float m_new = softmax_row_max(s_acc_n0, s_acc_n1, rmax);
             __builtin_amdgcn_sched_barrier(0x7F); // CK barrier 5 — after bpermute, all non-MFMA
 
-            // V staging (between softmax row_max and softmax exp)
+            // ---- V STAGING (slotted between row_max and exp so its LDS write +
+            // the next half's DRAM load overlap the upcoming exp/sum/GEMM1) ----
+            // Drain the V regs loaded above, shuffle+store V half 0 into LDS
+            // (LdsSeq[2]) for GEMM1, then start loading V half 1 (rows +32).
             s_waitcnt_vmcnt_0();
             store_v_to_lds(v_k3_0, v_k3_1, lds, LdsSeq[2]);
             v2i v1_k3_0, v1_k3_1;
@@ -186,12 +330,19 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
 
             __builtin_amdgcn_sched_barrier(0); // CK barrier 6 — after V-staging, before O-rescale + GEMM1
 
-            // Softmax exp + sum + rescale + pack + GEMM1
-            // All in one scheduling region so compiler can interleave with MFMA
+            // ---- SOFTMAX part 2 + ONLINE update + GEMM1 (one scheduling region
+            // so the compiler interleaves the VALU exp/pack with GEMM1's MFMA) ----
+            // exp2 turns scores into probabilities P = exp2(scale*(S - m_new)),
+            // applying the deferred scale; row_sum reduces this tile's P to l_new.
             float scale_m = scale_s * m_new;
             softmax_exp2(s_acc_n0, s_acc_n1, scale_s, scale_m);
             float l_new = softmax_row_sum(s_acc_n0, s_acc_n1);
 
+            // ONLINE-SOFTMAX correction: if the running max grew (rmax -> m_new),
+            // every prior contribution used too-large probabilities by the factor
+            // exp2(scale*(rmax-m_new)) (in (0,1]). Rescale the carried numerator
+            // o_acc and denominator rsum by it BEFORE folding in this tile, then
+            // advance the running max. (m_new==rmax => factor 1 => no-op.)
             float rescale = __builtin_amdgcn_exp2f(scale_s * (rmax - m_new));
             rescale_o_acc(o_acc_d0, o_acc_d1, rescale);
             rsum = rescale * rsum + l_new;
@@ -201,7 +352,10 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             // v_perm_b32 (selector 0x07060302 extracts the high 16 bits of
             // each fp32). A separate &=0xFFFF0000 pass would be redundant.
 
-            // GEMM1 — pack P inline per MFMA for better interleaving
+            // ---- GEMM1 sub-tile 0: O_acc += P_n0 . V_half0 ----
+            // block_sync_lds() makes V half 0 (just stored) visible to all waves.
+            // P is packed to bf16 inline inside gemm1_subtile. After the MFMA,
+            // shuffle+store V half 1 into LDS (LdsSeq[3]) for sub-tile 1.
             {
                 block_sync_lds();
                 gemm1_subtile(o_acc_d0, o_acc_d1, s_acc_n0, lds, LdsSeq[2]);
@@ -209,6 +363,9 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
                 store_v_to_lds(v1_k3_0, v1_k3_1, lds, LdsSeq[3]);
             }
 
+            // Advance to the next tile and PREFETCH its K half 0 (into LdsSeq[0],
+            // the buffer GEMM0 reads first next iteration) so the copy overlaps
+            // this iteration's remaining GEMM1. Skipped on the last iteration.
             i_total_loops++;
             if (i_total_loops < num_total_loop) {
                 kv_offset += kN0;
@@ -218,6 +375,7 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
                 k_col_offset += kK0;
             }
 
+            // ---- GEMM1 sub-tile 1: O_acc += P_n1 . V_half1 (LdsSeq[3]) ----
             {
                 block_sync_lds();
                 gemm1_subtile(o_acc_d0, o_acc_d1, s_acc_n1, lds, LdsSeq[3]);
@@ -228,7 +386,11 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
 
     } while (i_total_loops < num_total_loop);
 
-    // EPILOGUE
+    // ---- EPILOGUE: normalize O_acc by rsum, bf16-truncate, store O (+LSE) ----
+    // Resolve the LSE output base for this (batch/varlen, head). For varlen the LSE
+    // tensor is packed like Q (nhead_stride derived from Q's element strides + the
+    // sequence offset); for dense it is [batch][head][seqlen_q]. nullptr if the
+    // caller did not request LSE.
     float* lse_base = nullptr;
     if (params.lse) {
         if constexpr (IsVarlen) {
@@ -241,6 +403,8 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
         }
     }
 
+    // Hand the final running numerator (o_acc), denominator (rsum) and max (rmax)
+    // to the epilogue, which divides, truncates to bf16, and writes O/LSE to DRAM.
     epilog_store(o_acc_d0, o_acc_d1, rsum, rmax, params.scale,
                  params.stride_o, lse_base, seqlen_q, m_tile_idx, o_base);
 }

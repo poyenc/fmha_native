@@ -39,7 +39,7 @@ set_source_files_properties(
     COMPILE_FLAGS "--offload-arch=${GPU_TARGET}")
 
 # Kernel library
-add_library(fmha_kernel STATIC src/kernel/fmha_fwd_d64_kernel.cpp)
+add_library(fmha_kernel STATIC src/fused/kernel.cpp)
 target_include_directories(fmha_kernel PUBLIC src)
 target_link_libraries(fmha_kernel PUBLIC hip::device)
 target_compile_options(fmha_kernel PRIVATE
@@ -52,7 +52,7 @@ target_compile_options(fmha_kernel PRIVATE
     -fno-offload-uniform-block
     -fgpu-flush-denormals-to-zero)
 set_source_files_properties(
-    src/kernel/fmha_fwd_d64_kernel.cpp
+    src/fused/kernel.cpp
     PROPERTIES LANGUAGE HIP)
 
 # Test: GPU ref vs CPU ref

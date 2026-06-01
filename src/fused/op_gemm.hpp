@@ -1,5 +1,5 @@
 #pragma once
-#include "fmha_fwd_d64_lds.hpp"
+#include "op_lds.hpp"
 
 typedef float v16f __attribute__((ext_vector_type(16)));
 typedef short v4h __attribute__((ext_vector_type(4)));

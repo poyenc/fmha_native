@@ -1,5 +1,5 @@
 #pragma once
-#include "fmha_fwd_d64_gemm.hpp"
+#include "op_gemm.hpp"
 
 // ================================================================
 // Phase 2: Softmax functions (from Phase 1 K3/K4, golden-verified)

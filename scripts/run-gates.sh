@@ -20,7 +20,7 @@ GOLDEN_ROOT="/tmp/fmha-native-isa-match/golden"
 STAGES="g1,g2,g3"
 
 STANDALONE=(test_k_lds test_qk_gemm test_row_max test_softmax test_v_lds test_pv_gemm test_epilog)
-KERNEL_S_SRC="fmha_fwd_d64_kernel-hip-amdgcn-amd-amdhsa-gfx942.s"
+KERNEL_S_SRC="kernel-hip-amdgcn-amd-amdhsa-gfx942.s"
 KERNEL_S_DST="${REPO_ROOT}/native_d64_kernel.s"
 
 usage() {

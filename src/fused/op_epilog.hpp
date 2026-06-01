@@ -1,5 +1,5 @@
 #pragma once
-#include "fmha_fwd_d64_gemm.hpp"
+#include "op_gemm.hpp"
 
 // ================================================================
 // Phase 3: Epilog — normalize O_acc, compute LSE, bf16 buffer_store

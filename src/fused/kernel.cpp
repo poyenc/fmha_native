@@ -1,5 +1,5 @@
 #include "runner/params.hpp"
-#include "kernel/fmha_fwd_d64_device.hpp"
+#include "fused/pipeline.hpp"
 
 __global__ void __launch_bounds__(kBlockSize, 4)
 fmha_fwd_d64_bf16_msk0(FmhaFwdParams params) {

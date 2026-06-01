@@ -1,10 +1,10 @@
 #pragma once
 #include <hip/hip_runtime.h>
 #include "runner/params.hpp"
-#include "fmha_fwd_d64_lds.hpp"
-#include "fmha_fwd_d64_gemm.hpp"
-#include "fmha_fwd_d64_softmax.hpp"
-#include "fmha_fwd_d64_epilog.hpp"
+#include "op_lds.hpp"
+#include "op_gemm.hpp"
+#include "op_softmax.hpp"
+#include "op_epilog.hpp"
 
 __device__ __forceinline__ __amdgpu_buffer_rsrc_t make_buffer_resource(const void* base) {
     return __builtin_amdgcn_make_buffer_rsrc(

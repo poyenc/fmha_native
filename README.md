@@ -108,9 +108,8 @@ Causal (`--mask 1`, ×0.5 FLOP convention):
 | 1 | 2  | 40000 | 299.7 | 241.7 | 124.0% |
 
 TFLOPS are in TFLOP/s. The `B1 H2 S40000` causal config is ragged/low-occupancy (CK regresses
-there) — treat it as an outlier. Per-file roles and the same tables live in
-[`src/fused/README.md`](src/fused/README.md); see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-§5 for why causal closed to ~97% (the M-tile load-balance fix).
+there) — treat it as an outlier. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §5 for why
+causal closed to ~97% (the M-tile load-balance fix).
 
 ## Benchmark
 

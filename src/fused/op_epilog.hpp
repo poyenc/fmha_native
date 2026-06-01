@@ -26,8 +26,9 @@
 // Store: 8 × buffer_store_dwordx2 (4 bf16 per store = 32 bf16 total).
 // bf16 truncation via v_perm_b32 (not RNE). Matches CK epilog pattern.
 //
-// LSE: (log2(rsum) + scale*rmax) * ln(2). rmax is unscaled; apply scale here.
-// Stored to lse_base[m_row].
+// LSE: (logf(rsum) + scale*rmax) * ln(2). rmax is unscaled (scale applied here);
+// note logf(rsum) is natural log while scale*rmax is exp2-domain — see the
+// per-line note at the computation for the domain caveat. Stored to lse_base[m_row].
 //
 // epilog_store: normalize + bf16-truncate + buffer_store one M-tile of O, plus
 // the optional LSE row. Distribution assumptions: O_acc is in the TransposedC
@@ -75,12 +76,18 @@ __device__ __forceinline__ void epilog_store(
     // the whole row was masked (e.g. fully out of causal range) -> emit zeros.
     float inv_sum = (rsum > 0.0f) ? 1.0f / rsum : 0.0f;
 
-    // Log-sum-exp for this row. rmax is the UNSCALED running max, so `scale` is
-    // applied here to put it in the same log domain as the accumulated rsum; the
-    // trailing 0.6931... = ln(2) converts the log2-domain quantity (rsum/rmax come
-    // from the exp2-based softmax) into natural log, the convention the LSE output
-    // expects. Only k_sub==0 writes — the other half holds the identical reduced
-    // value and would just clobber the same address. Fully-masked rows -> -INF.
+    // Log-sum-exp for this row, computed as (logf(rsum) + scale*rmax) * ln(2).
+    //   - rmax is the UNSCALED running max; `scale` (log2e-based) puts scale*rmax
+    //     in the exp2 domain, then *ln(2) converts that term to natural units
+    //     (scale*rmax*ln(2) == sm_scale*rmax, the natural-domain max term).
+    //   - rsum is a plain probability sum (denominator of softmax), so logf(rsum)
+    //     is ALREADY natural log. Note the *ln(2) therefore also multiplies this
+    //     term — i.e. the two terms are NOT in the same domain before the scale.
+    //     This matches the kernel's chosen LSE output convention; if you ever need
+    //     strict natural-log LSE parity with a reference, check this factor against
+    //     the CK definition rather than trusting this line.
+    // Only k_sub==0 writes — the other half holds the identical reduced value and
+    // would just clobber the same address. Fully-masked rows -> -INF.
     if (lse_base && k_sub == 0 && abs_m_row < seqlen_q) {
         float lse_val = (rsum > 0.0f)
             ? (__builtin_amdgcn_logf(rsum) + scale * rmax) * 0.6931471805599453f

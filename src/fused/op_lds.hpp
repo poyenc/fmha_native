@@ -248,7 +248,7 @@ __device__ __forceinline__ void load_v_from_dram(
     v2i& out_k3_0, v2i& out_k3_1,
     __amdgpu_buffer_rsrc_t v_srd,
     int stride_v,         // in bf16 elements
-    int kv_offset)        // row offset (includes k1 adjustment for sub-tile 1)
+    int kv_byte_base)     // kv_offset * stride_v * 2, precomputed by caller (induction var)
 {
     const int lane_id = threadIdx.x & 63;
     const int warp_id = threadIdx.x >> 6;
@@ -257,13 +257,16 @@ __device__ __forceinline__ void load_v_from_dram(
     int k_within = lane_id & 3;
     int stride_bytes = stride_v * 2;     // bf16 row stride -> bytes
 
-    int v_row_base = kv_offset + warp_id * 8 + k_within * 2;
+    // Per-thread, TILE-INVARIANT row offset (warp_id*8 + k_within*2). The
+    // tile-VARIANT part (kv_offset*stride) arrives pre-multiplied as kv_byte_base,
+    // so no per-tile multiply by kv_offset remains — strength-reduced to an add.
+    int row_in_tile_bytes = (warp_id * 8 + k_within * 2) * stride_bytes;
     int v_col_bytes = (n_hdim * 4) * 2;  // 4 bf16 along hdim -> bytes
 
-    // The two rows (v_row_base and v_row_base+1) are the k3=0 / k3=1 pair this
-    // lane owns; each is one b64 = dwordx2 = 4 contiguous bf16 along hdim.
-    int voff_k3_0 = v_row_base * stride_bytes + v_col_bytes;
-    int voff_k3_1 = (v_row_base + 1) * stride_bytes + v_col_bytes;
+    // The two rows (this lane's k3=0 / k3=1 pair); each is one b64 = dwordx2 =
+    // 4 contiguous bf16 along hdim. voff_k3_1 is the next row (+1 stride).
+    int voff_k3_0 = kv_byte_base + row_in_tile_bytes + v_col_bytes;
+    int voff_k3_1 = voff_k3_0 + stride_bytes;
 
     out_k3_0 = __builtin_amdgcn_raw_buffer_load_b64(v_srd, voff_k3_0, 0, 0);
     out_k3_1 = __builtin_amdgcn_raw_buffer_load_b64(v_srd, voff_k3_1, 0, 0);

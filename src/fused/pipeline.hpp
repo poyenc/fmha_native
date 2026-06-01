@@ -256,6 +256,13 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     int kv_offset = seqlen_k_start;
     int k_col_offset = 0;
 
+    // V byte-base induction variable: kv_offset pre-multiplied into the V row
+    // stride (bytes). load_v_from_dram consumes this directly so the per-tile
+    // address math is a constant add, not a multiply. kv_offset is wave-uniform
+    // (from blockIdx) so this stays in an SGPR — no VGPR-budget cost.
+    const int v_stride_bytes = params.stride_v * 2;
+    int kv_v_byte = kv_offset * v_stride_bytes;
+
     // After Q load, before K prefetch — match CK prologue barriers 1-2.
     // (sched_barriers are codegen/parity fences, ~0% perf — see file header.)
     __builtin_amdgcn_sched_barrier(0);
@@ -297,7 +304,7 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             s_barrier();
             __builtin_amdgcn_sched_barrier(0); // CK barrier 2 — after s_barrier, before V-load + GEMM0.1
             v2i v_k3_0, v_k3_1;
-            load_v_from_dram(v_k3_0, v_k3_1, srd_v, params.stride_v, kv_offset);
+            load_v_from_dram(v_k3_0, v_k3_1, srd_v, params.stride_v, kv_v_byte);
             __builtin_amdgcn_sched_barrier(0); // CK barrier 3 — after V-load, before GEMM0.1
             gemm0_subtile(s_acc_n0, s_acc_n1, slice_q(q_regs, 1), lds, LdsSeq[1]);
             __builtin_amdgcn_sched_barrier(0x1); // CK barrier 4 — GEMM0 exit, VALU-only
@@ -322,7 +329,7 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             s_waitcnt_vmcnt_0();
             store_v_to_lds(v_k3_0, v_k3_1, lds, LdsSeq[2]);
             v2i v1_k3_0, v1_k3_1;
-            load_v_from_dram(v1_k3_0, v1_k3_1, srd_v, params.stride_v, kv_offset + 32);
+            load_v_from_dram(v1_k3_0, v1_k3_1, srd_v, params.stride_v, kv_v_byte + 32 * v_stride_bytes);
             // v1 load left in flight: its only consumer is store_v_to_lds at the
             // end of GEMM1 (already guarded by s_waitcnt_vmcnt_0 there). Draining
             // here would expose the V-load HBM latency instead of overlapping it
@@ -369,6 +376,7 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             i_total_loops++;
             if (i_total_loops < num_total_loop) {
                 kv_offset += kN0;
+                kv_v_byte += kN0 * v_stride_bytes;   // advance V byte-base by a loop constant
                 k_col_offset = 0;
                 s_barrier();
                 async_copy_k_subtile(lds, srd_k, params.stride_k, kv_offset, k_col_offset, LdsSeq[0]);

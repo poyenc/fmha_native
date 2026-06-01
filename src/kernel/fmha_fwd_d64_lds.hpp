@@ -43,7 +43,12 @@ __device__ __forceinline__ void async_load_fence(int cnt = 0) {
 }
 
 __device__ __forceinline__ void s_barrier() {
-    asm volatile("s_barrier" ::: "memory");
+    __builtin_amdgcn_s_barrier();
+}
+
+__device__ __forceinline__ void block_sync_lds() {
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+    __builtin_amdgcn_s_barrier();
 }
 
 // ---- ds_bpermute: read another lane's VGPR ----

@@ -196,7 +196,7 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
 
             // GEMM1 — pack P inline per MFMA for better interleaving
             {
-                s_barrier();
+                block_sync_lds();
                 gemm1_subtile(o_acc_d0, o_acc_d1, s_acc_n0, lds, LdsSeq[2]);
                 s_waitcnt_vmcnt_0();
                 store_v_to_lds(v1_k3_0, v1_k3_1, lds, LdsSeq[3]);
@@ -212,7 +212,7 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             }
 
             {
-                s_barrier();
+                block_sync_lds();
                 gemm1_subtile(o_acc_d0, o_acc_d1, s_acc_n1, lds, LdsSeq[3]);
             }
 

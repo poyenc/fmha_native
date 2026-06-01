@@ -1,2 +1,8 @@
 .claude/
 docs/
+build/
+build2/
+build_qa/
+workloads/
+.rocprofv3/
+native_d64_kernel.s

@@ -123,27 +123,6 @@ __device__ __forceinline__ float softmax_row_sum(
     return local_sum + other;
 }
 
-// ---- P bf16 truncation (not RNE) ----
-//
-// Truncates P fp32 values to bf16 in-place (clear lower 16 bits).
-// From Phase 1 K4.
-
-__device__ __forceinline__ void softmax_p_to_bf16(
-    v16f& p_n0,
-    v16f& p_n1)
-{
-    // Truncate fp32 to bf16-in-fp32 by clearing lower 16 bits.
-    // Uses reinterpret_cast instead of __builtin_bit_cast to avoid
-    // a compiler miscompile on ext_vector_type element access.
-    auto* u0 = reinterpret_cast<uint32_t*>(&p_n0);
-    auto* u1 = reinterpret_cast<uint32_t*>(&p_n1);
-    #pragma unroll
-    for (int i = 0; i < 16; i++) {
-        u0[i] &= 0xFFFF0000u;
-        u1[i] &= 0xFFFF0000u;
-    }
-}
-
 // ---- Rescale O_acc when max changes between tiles ----
 //
 // o_acc *= exp2(old_max - new_max) per element.

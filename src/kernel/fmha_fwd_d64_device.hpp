@@ -193,7 +193,9 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             rsum = rescale * rsum + l_new;
             rmax = m_new;
 
-            softmax_p_to_bf16(s_acc_n0, s_acc_n1);
+            // P fp32->bf16 truncation is done inline by gemm1_subtile's
+            // v_perm_b32 (selector 0x07060302 extracts the high 16 bits of
+            // each fp32). A separate &=0xFFFF0000 pass would be redundant.
 
             // GEMM1 — pack P inline per MFMA for better interleaving
             {

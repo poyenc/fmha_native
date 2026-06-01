@@ -38,38 +38,31 @@ __device__ __forceinline__ void softmax_scale_and_mask(
 {
     const int k_sub = (threadIdx.x & 63) >> 5;
 
-    // Compute comparison thresholds once, then compare against per-register
-    // column offsets using inline adds.  This avoids the compiler hoisting
-    // 14 pre-computed column-index VGPRs across the tile loop (CK pattern:
-    // single base + immediate per comparison).
     const int col_base = kv_offset + k_sub * 8;
-    const int seqlen_k_limit = seqlen_k - col_base;        // n_col >= seqlen_k  ⟺  offset >= limit
-    const int causal_limit = m_row + mask_shift - col_base; // n_col > threshold ⟺  offset > limit
+    int limit = seqlen_k - col_base;
+    if constexpr (HasMask) {
+        int causal = m_row + mask_shift - col_base + 1;
+        limit = (causal < limit) ? causal : limit;
+    }
 
+    // Scale via v_pk_mul_f32 (2 elements per instruction)
+    auto* pk0 = reinterpret_cast<__attribute__((ext_vector_type(2))) float*>(&s_acc_n0);
+    auto* pk1 = reinterpret_cast<__attribute__((ext_vector_type(2))) float*>(&s_acc_n1);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        pk0[i] *= scale_s_log2e;
+        pk1[i] *= scale_s_log2e;
+    }
+
+    // Combined mask: 1 compare per element
+    constexpr int offsets[16] = {0,1,2,3,4,5,6,7, 16,17,18,19,20,21,22,23};
     #pragma unroll
     for (int i = 0; i < 16; i++) {
-        // Per-register N-column offset relative to col_base.
-        // Constant per i, so the compiler can fold into immediates.
-        constexpr int offsets[16] = {0,1,2,3,4,5,6,7, 16,17,18,19,20,21,22,23};
         const int off = offsets[i];
-
-        // Scale
-        s_acc_n0[i] *= scale_s_log2e;
-        s_acc_n1[i] *= scale_s_log2e;
-
-        // Boundary mask (seqlen_k OOB)
-        if (off >= seqlen_k_limit)
+        if (off >= limit)
             s_acc_n0[i] = -INFINITY;
-        if (off + 32 >= seqlen_k_limit)
+        if (off + 32 >= limit)
             s_acc_n1[i] = -INFINITY;
-
-        // Causal mask
-        if constexpr (HasMask) {
-            if (off > causal_limit)
-                s_acc_n0[i] = -INFINITY;
-            if (off + 32 > causal_limit)
-                s_acc_n1[i] = -INFINITY;
-        }
     }
 }
 
@@ -81,10 +74,11 @@ __device__ __forceinline__ void softmax_scale_and_mask(
 
 __device__ __forceinline__ float softmax_row_max(
     const v16f& s_acc_n0,
-    const v16f& s_acc_n1)
+    const v16f& s_acc_n1,
+    float rmax = -INFINITY)
 {
-    // Intra-lane max over 32 registers (16 from n0, 16 from n1)
-    float local_max = -INFINITY;
+    // Intra-lane max over 32 registers + previous rmax (avoids -INF when all masked)
+    float local_max = rmax;
     #pragma unroll
     for (int i = 0; i < 16; i++) {
         local_max = fmaxf(local_max, s_acc_n0[i]);
@@ -170,14 +164,20 @@ __device__ __forceinline__ void softmax_p_to_bf16(
 
 __device__ __forceinline__ void rescale_o_acc(
     v16f& o_acc_d0, v16f& o_acc_d1,
-    float old_max, float new_max)
+    float factor)
 {
-    float factor = __builtin_amdgcn_exp2f(old_max - new_max);
     #pragma unroll
     for (int i = 0; i < 16; i++) {
         o_acc_d0[i] *= factor;
         o_acc_d1[i] *= factor;
     }
+}
+
+__device__ __forceinline__ void rescale_o_acc(
+    v16f& o_acc_d0, v16f& o_acc_d1,
+    float old_max, float new_max)
+{
+    rescale_o_acc(o_acc_d0, o_acc_d1, __builtin_amdgcn_exp2f(old_max - new_max));
 }
 
 // ================================================================

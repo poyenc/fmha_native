@@ -122,7 +122,7 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             q_regs[kstep] = v4i{0, 0, 0, 0};
     }
 
-    float rmax = -INFINITY;
+    float rmax = -5000.0f;
     float rsum = 0.0f;
 
     int kv_offset = seqlen_k_start;
@@ -159,55 +159,45 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
         {
             async_copy_fence();
             s_barrier();
+            __builtin_amdgcn_sched_barrier(0); // CK barrier 2 — after s_barrier, before V-load + GEMM0.1
             v2i v_k3_0, v_k3_1;
             load_v_from_dram(v_k3_0, v_k3_1, srd_v, params.stride_v, kv_offset);
-            __builtin_amdgcn_sched_barrier(0); // hot-loop barrier 6 — after V prefetch
+            __builtin_amdgcn_sched_barrier(0); // CK barrier 3 — after V-load, before GEMM0.1
             gemm0_subtile(s_acc_n0, s_acc_n1, slice_q(q_regs, 1), lds, LdsSeq[1]);
+            __builtin_amdgcn_sched_barrier(0x1); // CK barrier 4 — GEMM0 exit, VALU-only
 
-            __builtin_amdgcn_sched_barrier(0); // hot-loop barrier 7 — GEMM0 tail
+            // Softmax scale+mask + row_max
+            float scale_s_log2e = params.scale;
+            softmax_scale_and_mask<HasMask>(s_acc_n0, s_acc_n1, scale_s_log2e,
+                                            seqlen_k, kv_offset, abs_m_row, mask_shift);
+            float m_new = softmax_row_max(s_acc_n0, s_acc_n1, rmax);
+            __builtin_amdgcn_sched_barrier(0x7F); // CK barrier 5 — after bpermute, all non-MFMA
 
-            __builtin_amdgcn_sched_barrier(0x1); // hot-loop barrier 8 — GEMM0 exit, VALU-only
-
-            // V staging
+            // V staging (between softmax row_max and softmax exp)
             s_waitcnt_vmcnt_0();
             store_v_to_lds(v_k3_0, v_k3_1, lds, LdsSeq[2]);
             v2i v1_k3_0, v1_k3_1;
             load_v_from_dram(v1_k3_0, v1_k3_1, srd_v, params.stride_v, kv_offset + 32);
             s_waitcnt_vmcnt_0();
 
-            __builtin_amdgcn_sched_barrier(0); // hot-loop barrier 10 — post V-staging
+            __builtin_amdgcn_sched_barrier(0); // CK barrier 6 — after V-staging, before O-rescale + GEMM1
 
-            // Softmax
-            float scale_s_log2e = params.scale;
-            softmax_scale_and_mask<HasMask>(s_acc_n0, s_acc_n1, scale_s_log2e,
-                                            seqlen_k, kv_offset, abs_m_row, mask_shift);
-            float m_new = softmax_row_max(s_acc_n0, s_acc_n1);
-            __builtin_amdgcn_sched_barrier(0x7F); // hot-loop barrier 9 — after bpermute, all non-MFMA
-            if (m_new == -INFINITY) m_new = rmax;
+            // Softmax exp + sum + rescale + pack + GEMM1
+            // All in one scheduling region so compiler can interleave with MFMA
             softmax_exp2(s_acc_n0, s_acc_n1, m_new);
             float l_new = softmax_row_sum(s_acc_n0, s_acc_n1);
 
-            if (i_total_loops > 0) {
-                if (rmax != m_new) {
-                    rescale_o_acc(o_acc_d0, o_acc_d1, rmax, m_new);
-                    rsum = __builtin_amdgcn_exp2f(rmax - m_new) * rsum + l_new;
-                } else {
-                    rsum += l_new;
-                }
-            } else {
-                rsum = l_new;
-            }
+            float rescale = __builtin_amdgcn_exp2f(rmax - m_new);
+            rescale_o_acc(o_acc_d0, o_acc_d1, rescale);
+            rsum = rescale * rsum + l_new;
             rmax = m_new;
 
             softmax_p_to_bf16(s_acc_n0, s_acc_n1);
 
-            // GEMM1
-            v4h p_packed_0[4];
-            pack_p_subtile(p_packed_0, s_acc_n0);
-
+            // GEMM1 — pack P inline per MFMA for better interleaving
             {
                 s_barrier();
-                gemm1_subtile(o_acc_d0, o_acc_d1, p_packed_0, lds, LdsSeq[2]);
+                gemm1_subtile(o_acc_d0, o_acc_d1, s_acc_n0, lds, LdsSeq[2]);
                 s_waitcnt_vmcnt_0();
                 store_v_to_lds(v1_k3_0, v1_k3_1, lds, LdsSeq[3]);
             }
@@ -222,10 +212,8 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             }
 
             {
-                v4h p_packed_1[4];
-                pack_p_subtile(p_packed_1, s_acc_n1);
                 s_barrier();
-                gemm1_subtile(o_acc_d0, o_acc_d1, p_packed_1, lds, LdsSeq[3]);
+                gemm1_subtile(o_acc_d0, o_acc_d1, s_acc_n1, lds, LdsSeq[3]);
             }
 
 

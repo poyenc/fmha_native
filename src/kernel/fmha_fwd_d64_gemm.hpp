@@ -160,61 +160,47 @@ __device__ __forceinline__ const v16f& slice_p(
     return (v_subtile_idx == 0) ? p_n0 : p_n1;
 }
 
-// One sub-tile of GEMM1: read V from LDS, execute 2 ksteps × 2 passes × 2 hdim-tiles = 8 MFMA.
-//
-// V is A-operand (LDS), P is B-operand (register).
-// NO SwizzleA on V reads — bare lane%32 for hdim position.
-// The SwizzleA effect on O_acc comes from P being in SwizzleA'd layout
-// (inherited from GEMM0's output).
-//
-// V LDS layout: same padded layout as K.
-//   V element offset: lds_elem_offset(seqk_local, hdim_pos)
-//   where seqk_local = seqk within the 32-row slice stored in this buffer.
-//
-// Parameters:
-//   o_acc_d0, o_acc_d1: accumulator for hdim-tile 0 (0..31) and 1 (32..63)
-//   p_packed: 4 v4h from pack_p_subtile() for this sub-tile
-//   lds: LDS base pointer
-//   buf_idx: which LDS buffer holds V for this sub-tile
+// One sub-tile of GEMM1: pack P inline and execute 8 MFMA.
+// Fuses pack_p + gemm1 so the compiler can interleave packing with MFMA co-execution.
 __device__ __forceinline__ void gemm1_subtile(
     v16f& o_acc_d0, v16f& o_acc_d1,
-    const v4h* p_packed,
+    const v16f& p_half,
     char* lds,
     int buf_idx)
 {
+    constexpr unsigned kFp32ToBf16Sel = 0x07060302;
     const int lane_id = threadIdx.x & 63;
     const int k_sub   = lane_id >> 5;
-
-    // V hdim read position: bare lane%32, NO SwizzleA.
     const int hdim_pos = lane_id & 31;
     const int buf_byte_base = buf_base_bytes(buf_idx);
+    const auto* u = reinterpret_cast<const unsigned*>(&p_half);
 
     #pragma unroll
     for (int kstep = 0; kstep < 2; ++kstep) {
-        // seqk position within the 32-row V slice in this buffer
         const int seqk_local = kstep * 16 + k_sub * 8;
-
-        // V(A) reads from LDS — both hdim tiles from same buffer
-        // V uses the ds_write2 layout (v_lds_elem_offset), NOT the async copy layout.
         const v4i v0 = *reinterpret_cast<const v4i*>(
             lds + buf_byte_base + v_lds_elem_offset(seqk_local, hdim_pos) * 2);
         const v4i v1 = *reinterpret_cast<const v4i*>(
             lds + buf_byte_base + v_lds_elem_offset(seqk_local, hdim_pos + 32) * 2);
 
-        // P(B) operand — pre-packed bf16
-        v4h b_val = p_packed[kstep * 2];
-
-        // Pass 0: seqk +0..3
+        // Pass 0: pack p[4*kstep*2 .. +3] inline, then MFMA
         {
+            int s = kstep * 2;
+            unsigned lo = __builtin_amdgcn_perm(u[4*s+1], u[4*s], kFp32ToBf16Sel);
+            unsigned hi = __builtin_amdgcn_perm(u[4*s+3], u[4*s+2], kFp32ToBf16Sel);
+            v4h b_val = pack_short4(lo, hi);
             v4h a0 = pack_short4(v0[0], v0[1]);
             v4h a1 = pack_short4(v1[0], v1[1]);
             o_acc_d0 = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(a0, b_val, o_acc_d0, 0, 0, 0);
             o_acc_d1 = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(a1, b_val, o_acc_d1, 0, 0, 0);
         }
 
-        // Pass 1: seqk +4..7
-        b_val = p_packed[kstep * 2 + 1];
+        // Pass 1: pack p[4*(kstep*2+1) .. +3] inline, then MFMA
         {
+            int s = kstep * 2 + 1;
+            unsigned lo = __builtin_amdgcn_perm(u[4*s+1], u[4*s], kFp32ToBf16Sel);
+            unsigned hi = __builtin_amdgcn_perm(u[4*s+3], u[4*s+2], kFp32ToBf16Sel);
+            v4h b_val = pack_short4(lo, hi);
             v4h a0 = pack_short4(v0[2], v0[3]);
             v4h a1 = pack_short4(v1[2], v1[3]);
             o_acc_d0 = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(a0, b_val, o_acc_d0, 0, 0, 0);

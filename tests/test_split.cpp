@@ -89,6 +89,15 @@
 extern __global__ void fmha_fwd_d64_bf16_msk0_split(FmhaFwdSplitParams);
 extern __global__ void fmha_fwd_d64_bf16_msk1_split(FmhaFwdSplitParams);
 
+// ---------------------------------------------------------------------------
+// The COMBINE consumer (defined in src/fused/kernel.cpp, same as test_combine).
+// The end-to-end test below feeds the REAL split kernel's scratch into THIS
+// kernel and checks the final O against full attention — closing the gap the
+// split-only / combine-only unit tests leave open (no gtest runs BOTH device
+// kernels through the shared scratch contract).
+// ---------------------------------------------------------------------------
+extern __global__ void fmha_fwd_d64_bf16_combine(FmhaFwdCombineParams);
+
 namespace {
 
 constexpr int kD = 64;            // head_dim this kernel is specialized for
@@ -278,6 +287,98 @@ void run_split(bool mask, const FmhaFwdParams& base, const SplitDims& dim,
 // The ragged G set: 2,8 divide a 32-tile count cleanly; 3,5 do not (ragged last
 // split).  Used for the S=2048 correctness sweep.
 const std::vector<int> kGSetRagged = {2, 3, 5, 8};
+
+// ---------------------------------------------------------------------------
+// GPU combine driver (for the END-TO-END test).  Mirrors test_combine.cpp's
+// run_combine launch pattern, but instead of host-built partials it consumes
+// the DEVICE scratch the real split kernel just wrote.  It therefore takes the
+// already-on-device scratch pointers (NOT host vectors) plus a device bf16 O
+// buffer to write the final result into, and launches over the forward grid
+// (Hq, m_tiles, B) — exactly the bench's combine grid.
+//
+//   d_sco / d_sclse : device scratch produced by the split kernel, split-major
+//                     [G][B][Hq][Sq][64] fp32 / [G][B][Hq][Sq] fp32.
+//   d_o_final       : device bf16 O, sized B*Hq*Sq*64, written by the combine.
+//   scale           : params.scale (base-2, log2e-folded) — only used by the
+//                     optional global-LSE write, which we leave disabled here.
+// Strides are contiguous BHSD (stride_o=D, nhead_stride_o=Sq*D,
+// batch_stride_o=Hq*Sq*D), matching make_base_params / the bench.
+// ---------------------------------------------------------------------------
+void run_combine_e2e(const SplitDims& dim, float scale,
+                     const float* d_sco, const float* d_sclse,
+                     __hip_bfloat16* d_o_final) {
+    const int G = dim.G, B = dim.B, Hq = dim.Hq, Sq = dim.Sq;
+
+    FmhaFwdCombineParams cp{};
+    cp.scratch_o      = d_sco;
+    cp.scratch_lse    = d_sclse;
+    cp.o              = d_o_final;
+    cp.lse            = nullptr;          // final O comparison only; no global LSE
+    cp.num_splits     = G;
+    cp.seqlen_q       = Sq;
+    cp.nhead_q        = Hq;
+    cp.stride_o       = kD;
+    cp.nhead_stride_o = Sq * kD;
+    cp.batch_stride_o = Hq * Sq * kD;
+    cp.scale          = scale;
+
+    const int m_tiles = (Sq + kM0 - 1) / kM0;
+    dim3 grid(Hq, m_tiles, B);            // forward grid: one block per (b,h,m_tile)
+    dim3 block(kBlockSize);
+    hipLaunchKernelGGL(fmha_fwd_d64_bf16_combine, grid, block, 0, nullptr, cp);
+    ASSERT_EQ(hipGetLastError(), hipSuccess);
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+}
+
+// run_split (above) frees its device scratch before returning, so it cannot be
+// reused for the e2e pipeline (the combine needs the SAME device scratch the
+// split wrote).  This variant keeps the device scratch ALIVE and returns the
+// device pointers by out-param; the caller owns them and must hipFree.  It is a
+// deliberate, minimal copy of run_split's body (poison-fill, upload, launch over
+// grid z=B*G) WITHOUT the device-free + readback, so the split→combine handoff
+// happens entirely on the device through the shared scratch — the exact contract
+// under test.
+void run_split_keep_scratch(bool mask, const FmhaFwdParams& base,
+                            const SplitDims& dim,
+                            float** d_sco_out, float** d_sclse_out) {
+    const int G = dim.G, B = dim.B, Hq = dim.Hq, Sq = dim.Sq;
+    const size_t n_o   = (size_t)G * B * Hq * Sq * kD;
+    const size_t n_lse = (size_t)G * B * Hq * Sq;
+
+    // Poison the scratch on the host then upload, so a split that skips a plane
+    // leaves a detectable value rather than uninitialised junk (the combine would
+    // then propagate the poison into O and the e2e comparison would fail loudly).
+    std::vector<float> h_sco(n_o, kPoisonO);
+    std::vector<float> h_sclse(n_lse, kPoisonLse);
+
+    float *d_sco = nullptr, *d_sclse = nullptr;
+    ASSERT_EQ(hipMalloc(&d_sco,   n_o   * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_sclse, n_lse * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_sco,   h_sco.data(),   n_o   * sizeof(float),
+                        hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_sclse, h_sclse.data(), n_lse * sizeof(float),
+                        hipMemcpyHostToDevice), hipSuccess);
+
+    FmhaFwdSplitParams sp{};
+    sp.base        = base;
+    sp.scratch_o   = d_sco;
+    sp.scratch_lse = d_sclse;
+    sp.num_splits  = G;
+    sp.split_idx   = 0;   // decoded device-side from blockIdx.z % G
+
+    const int m_tiles = (Sq + kM0 - 1) / kM0;
+    dim3 grid(Hq, m_tiles, B * G);        // z-axis carries batch*split
+    dim3 block(kBlockSize);
+    if (mask)
+        hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk1_split, grid, block, 0, nullptr, sp);
+    else
+        hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk0_split, grid, block, 0, nullptr, sp);
+    ASSERT_EQ(hipGetLastError(), hipSuccess);
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+    *d_sco_out   = d_sco;
+    *d_sclse_out = d_sclse;
+}
 
 } // namespace
 
@@ -698,6 +799,141 @@ TEST(SplitProducer, LargeS_vs_GpuRefSplit_Mask0) {
         // 2e-3 is a safe upper bound on the O / LSE drift.
         EXPECT_LT(max_abs_o,   2e-3f) << "S=" << c.S << " G=" << G << " O vs gpu_ref_split";
         EXPECT_LT(max_abs_lse, 2e-3f) << "S=" << c.S << " G=" << G << " LSE vs gpu_ref_split";
+    }
+}
+
+// ===========================================================================
+// CASE 7 — END-TO-END split → combine == full attention.
+//
+// This is the gap the split-only (this file's CASE 1-6) and combine-only
+// (test_combine.cpp) suites leave open: NO existing gtest runs BOTH real device
+// kernels through the shared scratch.  A wiring bug between them — e.g. a wrong
+// batch*G z-decode in the split grid, or a wrong batch index in the combine, or
+// a scratch stride mismatch — would write a self-consistent-but-wrong scratch
+// that each unit test passes (split matches its own oracle; combine matches the
+// HOST partials it is fed) yet that together produces the wrong final O.  Only
+// running split THEN combine on the SAME device scratch catches it.
+//
+// The invariant: split→combine final O must equal full attention for EVERY
+// (mask, B, G).  We use gpu_ref_fmha_fwd (the trusted full-attention oracle,
+// already used by the bench --verify path and test_fmha_gpu_ref) as ground
+// truth, computed into a SEPARATE device O buffer from the SAME Q/K/V.
+//
+// Why SMALL S is sufficient: the combine math is S-independent (it reweights G
+// per-row partials), and large-S split scratch OFFSETS are already covered by
+// CASE 6 (LargeS_vs_GpuRefSplit).  So small S exercises the full wiring quickly.
+//
+// Coverage matrix (deliberately a handful of tuples, NOT a full cross-product,
+// so the gate stays fast):
+//   * G ∈ {1,2,3,8}: 1 = identity-through-combine, 2/8 = clean tile division,
+//     3 = ragged/non-divisor (T=ceil(num_tiles/3) leaves a short last split).
+//   * mask ∈ {0,1}:  mask1 drives the causal sentinel (-inf/0) path through the
+//     WHOLE pipeline — the A4 invariant end-to-end.
+//   * B ∈ {1,2}:     B=2 is the coverage the unit tests LACK — it exercises the
+//     split grid's batch*G z-decode AND the combine's per-batch O indexing.
+//   * S with a partial last M-tile (S % kM0 != 0) to drive the row-bounds guard:
+//     S=1920 (15 full kM0 tiles) and S=2000 (15 tiles + 80 rows) are both used.
+//
+// TOLERANCE (documented).  The final O is bf16 and, under split-K, is a sum of
+// G reweighted fp32 partials, so element error is dominated by bf16 rounding of
+// O (~2^-8 ≈ 0.4% relative).  At these small-S magnitudes (~1e-2) an absolute
+// bound is not discriminating, so — mirroring bench_fmha_fwd.cpp's --verify — we
+// gate on TWO scale-aware metrics and require BOTH:
+//   * cosine similarity ≥ 0.99995 (catches directional/structural bugs: a wrong
+//     batch/split index garbles whole rows and collapses cosine), AND
+//   * relative-L2 error ≤ 2e-2 (catches magnitude bugs: a zeroed / wrong-scale
+//     output blows up rel-L2 even when cosine cannot see it).
+// A correct pipeline sits at cos≈0.99999 and rel-L2≈0.3% (the bf16 noise floor),
+// far inside both gates — but a wiring bug fails at least one.  max_abs is logged
+// for information only.  (These are exactly the bench's kCosTol/kRelL2Tol.)
+// ===========================================================================
+namespace {
+struct E2ECase { int mask; int B; int G; int S; };
+
+// A modest tuple list (NOT the cross-product) covering the matrix above.
+const std::vector<E2ECase> kE2ECases = {
+    // mask0: G sweep at B=1 (1=identity, 2/8 clean, 3 ragged), partial last tile.
+    {0, 1, 1, 1920}, {0, 1, 2, 1920}, {0, 1, 3, 2000}, {0, 1, 8, 1920},
+    // mask0: B=2 (batch*G z-decode + combine batch index) at a clean and a ragged G.
+    {0, 2, 2, 1920}, {0, 2, 3, 2000},
+    // mask1 (causal sentinel path end-to-end): G sweep at B=1 + one B=2.
+    {1, 1, 1, 1920}, {1, 1, 2, 1920}, {1, 1, 3, 2000}, {1, 1, 8, 1920},
+    {1, 2, 2, 1920}, {1, 2, 8, 2000},
+};
+}  // namespace
+
+TEST(SplitCombineE2E, MatchesFullAttention) {
+    // The two scale-aware gates (identical to bench_fmha_fwd.cpp --verify).
+    constexpr double kCosTol   = 0.99995;  // directional / structural
+    constexpr double kRelL2Tol = 2e-2;     // magnitude (2% rel L2)
+
+    for (const E2ECase& c : kE2ECases) {
+        const bool mask = (c.mask != 0);
+        FmhaParams p{};
+        p.batch = c.B; p.q_heads = 2; p.kv_heads = 2; p.gqa = 1;
+        p.seq_len = c.S; p.kv_seq_len = c.S; p.head_dim = kD; p.mask = c.mask;
+
+        const int B = p.batch, Hq = p.q_heads, Sq = p.seq_len;
+        SCOPED_TRACE(testing::Message() << "mask=" << c.mask << " B=" << B
+                                        << " G=" << c.G << " S=" << Sq);
+
+        // One random problem; Q/K/V on the device for BOTH the split kernel and
+        // the gpu_ref oracle (which read device Q/K/V via the same strides).
+        FmhaBuffers bufs(p);
+        bufs.fill_random(1234 + c.mask * 100 + c.B * 10 + c.G);
+        bufs.copy_to_device();
+        FmhaFwdParams base = make_base_params(p, bufs);
+
+        // --- Pipeline: real split → real combine through shared device scratch.
+        float *d_sco = nullptr, *d_sclse = nullptr;
+        run_split_keep_scratch(mask, base, {c.G, B, Hq, Sq}, &d_sco, &d_sclse);
+
+        // Final O written by the combine kernel (separate from the oracle's O).
+        const size_t n_o = (size_t)B * Hq * Sq * kD;
+        __hip_bfloat16* d_o_pipe = nullptr;
+        ASSERT_EQ(hipMalloc(&d_o_pipe, n_o * sizeof(__hip_bfloat16)), hipSuccess);
+        ASSERT_EQ(hipMemset(d_o_pipe, 0, n_o * sizeof(__hip_bfloat16)), hipSuccess);
+        run_combine_e2e({c.G, B, Hq, Sq}, base.scale, d_sco, d_sclse, d_o_pipe);
+        hipFree(d_sco); hipFree(d_sclse);
+
+        // --- Oracle: full attention from the SAME Q/K/V into a SEPARATE O buffer.
+        // make_gpu_ref_params points gp.d_O at bufs.d_O, which split does not use;
+        // override it to our own buffer so the two outputs never share storage.
+        __hip_bfloat16* d_o_ref = nullptr;
+        ASSERT_EQ(hipMalloc(&d_o_ref, n_o * sizeof(__hip_bfloat16)), hipSuccess);
+        ASSERT_EQ(hipMemset(d_o_ref, 0, n_o * sizeof(__hip_bfloat16)), hipSuccess);
+        GpuRefParams gp = make_gpu_ref_params(p, bufs);
+        gp.d_O = reinterpret_cast<uint16_t*>(d_o_ref);
+        gpu_ref_fmha_fwd(gp);
+        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+        // --- Pull both final O buffers back (bf16 → fp32) and compare.
+        std::vector<uint16_t> h_pipe(n_o), h_ref(n_o);
+        ASSERT_EQ(hipMemcpy(h_pipe.data(), d_o_pipe, n_o * sizeof(uint16_t),
+                            hipMemcpyDeviceToHost), hipSuccess);
+        ASSERT_EQ(hipMemcpy(h_ref.data(),  d_o_ref,  n_o * sizeof(uint16_t),
+                            hipMemcpyDeviceToHost), hipSuccess);
+        hipFree(d_o_pipe); hipFree(d_o_ref);
+
+        // Scale-aware metrics over all B*Hq*Sq*D elements (== bench --verify).
+        double max_abs = 0.0, dot = 0.0, na = 0.0, nb = 0.0, sse = 0.0;
+        for (size_t i = 0; i < n_o; ++i) {
+            const double a = bf16_to_float(h_pipe[i]);
+            const double b = bf16_to_float(h_ref[i]);
+            const double diff = a - b;
+            if (std::fabs(diff) > max_abs) max_abs = std::fabs(diff);
+            sse += diff * diff;
+            dot += a * b; na += a * a; nb += b * b;
+        }
+        const double denom   = std::sqrt(na) * std::sqrt(nb);
+        const double cos     = denom > 0.0 ? dot / denom : 1.0;
+        const double refnorm = std::sqrt(nb);
+        const double rel_l2  = refnorm > 0.0 ? std::sqrt(sse) / refnorm : INFINITY;
+
+        fprintf(stderr, "[E2E mask=%d B=%d G=%d S=%d] max_abs=%.6g cos=%.8f rel_l2=%.6g\n",
+                c.mask, B, c.G, Sq, max_abs, cos, rel_l2);
+        EXPECT_GE(cos,    kCosTol)   << "cosine below gate (structural/wiring bug?)";
+        EXPECT_LE(rel_l2, kRelL2Tol) << "relative L2 above gate (magnitude/wiring bug?)";
     }
 }
 

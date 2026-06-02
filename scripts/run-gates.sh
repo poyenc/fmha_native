@@ -5,7 +5,9 @@
 #   docker exec poyenc-fmha bash -c "/root/workspace/scripts/run-gates.sh"
 #
 # G2 bar: 67/67 fused (build/test_fmha_fwd_d64) + 49/49 standalone
-# (7 suites x 7 tests) using the golden dumps. Golden dirs default to
+# (7 suites x 7 tests) using the golden dumps + the split-K device tests
+# (test_split — incl. the end-to-end SplitCombineE2E case — and test_combine,
+# run WITHOUT golden args). Golden dirs default to
 # /tmp/fmha-native-isa-match/golden/{full,partial} (already staged in
 # poyenc-fmha). Without golden, the MatchesGolden cases GTEST_SKIP and the
 # bar is NOT met -- the script fails if the golden dirs are missing.
@@ -20,6 +22,14 @@ GOLDEN_ROOT="/tmp/fmha-native-isa-match/golden"
 STAGES="g1,g2,g3"
 
 STANDALONE=(test_k_lds test_qk_gemm test_row_max test_softmax test_v_lds test_pv_gemm test_epilog)
+# Split-K device tests.  Unlike the STANDALONE component suites these do NOT take
+# --golden-* args (their main() strips any --golden* flag and they have no golden
+# dependency); they just need a GPU.  They are run as a SEPARATE gate step WITHOUT
+# the golden args so the intent is explicit (passing golden flags they ignore
+# would be misleading).  test_split now also carries the end-to-end split→combine
+# vs full-attention case (SplitCombineE2E) — the only gtest that runs BOTH device
+# kernels through the shared scratch, so gating it here enforces that contract.
+SPLITK_TESTS=(test_split test_combine)
 KERNEL_S_SRC="kernel-hip-amdgcn-amd-amdhsa-gfx942.s"
 KERNEL_S_DST="${REPO_ROOT}/native_d64_kernel.s"
 
@@ -69,7 +79,7 @@ fail() { echo "GATE FAIL: $*" >&2; exit 1; }
 gate_g1() {
     echo "=== G1: build fmha_kernel + test binaries ==="
     cmake --build "$BUILD_DIR" \
-        --target fmha_kernel test_fmha_fwd_d64 "${STANDALONE[@]}" \
+        --target fmha_kernel test_fmha_fwd_d64 "${STANDALONE[@]}" "${SPLITK_TESTS[@]}" \
         -j"$(nproc)" || fail "G1 build failed"
     echo "G1 OK"
 }
@@ -100,7 +110,7 @@ run_gtest() {
 }
 
 gate_g2() {
-    echo "=== G2: tests (fused 67/67 + standalone 49/49 via golden) ==="
+    echo "=== G2: tests (fused 67/67 + standalone 49/49 via golden + split-K [test_split incl. SplitCombineE2E, test_combine]) ==="
     [ -f "${GOLDEN_FULL}/dump_lds.bin" ]    || fail "G2 missing golden full: ${GOLDEN_FULL}"
     [ -f "${GOLDEN_PARTIAL}/dump_lds.bin" ] || fail "G2 missing golden partial: ${GOLDEN_PARTIAL}"
 
@@ -108,6 +118,11 @@ gate_g2() {
     for t in "${STANDALONE[@]}"; do
         run_gtest "$t" "${BUILD_DIR}/${t}" \
             "--golden-full=${GOLDEN_FULL}" "--golden-partial=${GOLDEN_PARTIAL}"
+    done
+    # Split-K device tests (no golden args): split producer, combine consumer, and
+    # the end-to-end split→combine == full-attention case inside test_split.
+    for t in "${SPLITK_TESTS[@]}"; do
+        run_gtest "$t" "${BUILD_DIR}/${t}"
     done
     echo "G2 OK"
 }

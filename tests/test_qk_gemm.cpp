@@ -3,7 +3,7 @@
 //
 // What it validates: that the standalone GEMM0 kernel produces the correct
 // S = Q*K^T thread-buffer image. HOW, with two independent oracles:
-//   1. MatchesCpuRef  — vs ref_qk_gemm() (CPU brute force). Always runs.
+//   1. MatchesCpuRef  — vs cpu_ref_qk_gemm() (CPU brute force). Always runs.
 //   2. MatchesGolden  — vs CK's dump_reg slot 1 (S_ACC), bit-for-bit. Runs ONLY
 //      if a --golden-full / --golden-partial dir is passed; otherwise SKIPPED.
 // Plus a few CPU-ref-only edge cases (min tile, full M0, single K column).
@@ -23,7 +23,7 @@
 #include <vector>
 
 #include "runner/bf16_utils.hpp"
-#include "components_ref/ref_qk_gemm.hpp"
+#include "components_ref/cpu_ref_qk_gemm.hpp"
 #include "components/qk_gemm.hpp"
 
 static std::string g_golden_full;
@@ -126,7 +126,7 @@ TEST(QkGemmFullTile, MatchesCpuRef) {
     std::vector<float> got;
     run_kernel(hQ,sq,hK,sk,D,got);
     std::vector<float> exp(kQKOutElems);
-    ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,exp.data());
+    cpu_ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,exp.data());
     compare(got, exp, "full/cpuref");
 }
 
@@ -147,7 +147,7 @@ TEST(QkGemmPartialTile, MatchesCpuRef) {
     std::vector<float> got;
     run_kernel(hQ,sq,hK,sk,D,got);
     std::vector<float> exp(kQKOutElems);
-    ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,exp.data());
+    cpu_ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,exp.data());
     compare(got, exp, "partial/cpuref");
 }
 
@@ -170,7 +170,7 @@ TEST(QkGemmEdge, MinTile) {
     std::vector<float> got;
     run_kernel(hQ,sq,hK,sk,D,got);
     std::vector<float> exp(kQKOutElems);
-    ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,exp.data());
+    cpu_ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,exp.data());
     compare(got, exp, "edge/min");
 }
 
@@ -180,7 +180,7 @@ TEST(QkGemmEdge, FullM0) {
     std::vector<float> got;
     run_kernel(hQ,sq,hK,sk,D,got);
     std::vector<float> exp(kQKOutElems);
-    ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,exp.data());
+    cpu_ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,exp.data());
     compare(got, exp, "edge/fullM0");
 }
 
@@ -190,7 +190,7 @@ TEST(QkGemmEdge, SingleKCol) {
     std::vector<float> got;
     run_kernel(hQ,sq,hK,sk,D,got);
     std::vector<float> exp(kQKOutElems);
-    ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,exp.data());
+    cpu_ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,exp.data());
     compare(got, exp, "edge/singleK");
 }
 

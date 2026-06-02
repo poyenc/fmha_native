@@ -4,8 +4,8 @@
 // What it validates: the intra-lane + single-ds_bpermute row-max reduction.
 // HOW:
 //   - The kernel needs an S_acc input, so the CPU-ref tests first synthesize one
-//     with ref_qk_gemm (see compute_s_acc), then diff the kernel's rmax against
-//     ref_row_max(). EXACT compare — row-max is just fmaxf, no FMA rounding.
+//     with cpu_ref_qk_gemm (see compute_s_acc), then diff the kernel's rmax against
+//     cpu_ref_row_max(). EXACT compare — row-max is just fmaxf, no FMA rounding.
 //   - MatchesGolden feeds the kernel the GOLDEN S_ACC (slot 1) instead, and
 //     diffs against golden RMAX (slot 2). SKIPS without a golden dir.
 // =============================================================================
@@ -19,8 +19,8 @@
 #include <vector>
 
 #include "runner/bf16_utils.hpp"
-#include "components_ref/ref_row_max.hpp"
-#include "components_ref/ref_qk_gemm.hpp"
+#include "components_ref/cpu_ref_row_max.hpp"
+#include "components_ref/cpu_ref_qk_gemm.hpp"
 #include "components/row_max.hpp"
 
 static std::string g_golden_full;
@@ -46,7 +46,7 @@ std::vector<uint16_t> make_K(int seqlen, int D) {
 std::vector<float> compute_s_acc(const std::vector<uint16_t>& hQ, int sq,
                                  const std::vector<uint16_t>& hK, int sk, int D) {
     std::vector<float> s_acc(kQKOutElems);
-    ref_qk_gemm(hQ.data(), D, sq, hK.data(), D, sk, s_acc.data());
+    cpu_ref_qk_gemm(hQ.data(), D, sq, hK.data(), D, sk, s_acc.data());
     return s_acc;
 }
 
@@ -153,7 +153,7 @@ TEST(RowMaxFullTile, MatchesCpuRef) {
     run_kernel(s_acc, got);
 
     std::vector<float> exp(kRowMaxOutElems);
-    ref_row_max(s_acc.data(), exp.data());
+    cpu_ref_row_max(s_acc.data(), exp.data());
     compare_exact(got, exp, "full/cpuref");
 }
 
@@ -181,7 +181,7 @@ TEST(RowMaxPartialTile, MatchesCpuRef) {
     run_kernel(s_acc, got);
 
     std::vector<float> exp(kRowMaxOutElems);
-    ref_row_max(s_acc.data(), exp.data());
+    cpu_ref_row_max(s_acc.data(), exp.data());
     compare_exact(got, exp, "partial/cpuref");
 }
 
@@ -206,7 +206,7 @@ TEST(RowMaxEdge, MinTile) {
     std::vector<float> got;
     run_kernel(s_acc, got);
     std::vector<float> exp(kRowMaxOutElems);
-    ref_row_max(s_acc.data(), exp.data());
+    cpu_ref_row_max(s_acc.data(), exp.data());
     compare_exact(got, exp, "edge/min");
 }
 
@@ -217,7 +217,7 @@ TEST(RowMaxEdge, FullM0) {
     std::vector<float> got;
     run_kernel(s_acc, got);
     std::vector<float> exp(kRowMaxOutElems);
-    ref_row_max(s_acc.data(), exp.data());
+    cpu_ref_row_max(s_acc.data(), exp.data());
     compare_exact(got, exp, "edge/fullM0");
 }
 
@@ -228,7 +228,7 @@ TEST(RowMaxEdge, SingleKCol) {
     std::vector<float> got;
     run_kernel(s_acc, got);
     std::vector<float> exp(kRowMaxOutElems);
-    ref_row_max(s_acc.data(), exp.data());
+    cpu_ref_row_max(s_acc.data(), exp.data());
     compare_exact(got, exp, "edge/singleK");
 }
 

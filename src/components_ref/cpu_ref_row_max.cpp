@@ -1,8 +1,8 @@
-#include "components_ref/ref_row_max.hpp"
+#include "components_ref/cpu_ref_row_max.hpp"
 #include <cmath>
 #include <algorithm>
 
-void ref_row_max(const float* s_acc, float* rmax) {
+void cpu_ref_row_max(const float* s_acc, float* rmax) {
     // For each m_row (0..127), find max over all 64 N-columns from s_acc.
     // m_row = (lane%32) + 32*warp.
     // Lanes with same m_row: same (lane%32, warp) but k_sub=0 and k_sub=1.

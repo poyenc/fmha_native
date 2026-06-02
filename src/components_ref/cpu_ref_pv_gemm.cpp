@@ -1,4 +1,4 @@
-#include "components_ref/ref_pv_gemm.hpp"
+#include "components_ref/cpu_ref_pv_gemm.hpp"
 #include "runner/bf16_utils.hpp"
 
 // Invert the TransposedC layout to read logical P[m, n] out of the flat
@@ -19,7 +19,7 @@ static float get_p(const float* p_acc, int m, int n) {
     return p_acc[tid * 32 + r];
 }
 
-void ref_pv_gemm(const float* p_acc,
+void cpu_ref_pv_gemm(const float* p_acc,
                  const uint16_t* V, int stride_v, int seqlen_k,
                  float* out) {
     for (int tid = 0; tid < 256; ++tid) {

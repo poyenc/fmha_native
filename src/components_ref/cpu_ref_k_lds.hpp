@@ -42,7 +42,7 @@ inline int k_lds_offset_elems(int j, int d) {
 // staged K tile. `K` is the raw bf16 (uint16) K matrix, row-major, row stride
 // `stride_k` elements. `kv_offset` is the seqlen_k base row of this tile.
 // Out-of-range rows (>= seqlen_k) are left as zero.
-void ref_k_lds(const uint16_t* K,
+void cpu_ref_k_lds(const uint16_t* K,
                int stride_k,
                int kv_offset,
                int seqlen_k,

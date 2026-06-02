@@ -9,7 +9,7 @@
 // this file is a STANDALONE isolation of just the "stage K into LDS" step, used
 // ONLY by the unit test tests/test_k_lds.cpp. It is golden-verified (byte-exact
 // against a CK reference dump) and is NOT #included by src/fused/. Its sibling
-// CPU oracle is src/components_ref/ref_k_lds.{hpp,cpp}.
+// CPU oracle is src/components_ref/cpu_ref_k_lds.{hpp,cpp}.
 //
 // WHAT this stage does: copies a 64-row x 64-headdim K sub-tile from DRAM into
 // LDS (shared memory) using the GOLDEN-VERIFIED swizzled layout that GEMM0

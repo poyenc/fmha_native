@@ -44,6 +44,6 @@ inline int pv_ref_d_col(int tid, int r) {
 //   m = (lane%32)+32*warp, n = (r/8)*16+(lane/32)*8+(r%8).
 // These are bf16-promoted fp32 values.
 // V is raw bf16 row-major [seqlen_k, D=64].
-void ref_pv_gemm(const float* p_acc,     // [256*32] bf16-promoted fp32
+void cpu_ref_pv_gemm(const float* p_acc,     // [256*32] bf16-promoted fp32
                  const uint16_t* V, int stride_v, int seqlen_k,
                  float* out);            // [256*32] fp32 O_acc

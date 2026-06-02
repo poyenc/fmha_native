@@ -1,8 +1,8 @@
-#include "components_ref/ref_epilog.hpp"
+#include "components_ref/cpu_ref_epilog.hpp"
 #include "runner/bf16_utils.hpp"
 #include <cstring>
 
-void ref_epilog(const float* o_acc,
+void cpu_ref_epilog(const float* o_acc,
                 const float* rsum,
                 int seqlen_q,
                 float* o_final,

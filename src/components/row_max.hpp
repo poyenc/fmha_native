@@ -7,7 +7,7 @@
 //
 // Standalone isolation of the softmax row-max step, used ONLY by
 // tests/test_row_max.cpp. Golden-verified, NOT #included by src/fused/.
-// CPU oracle: src/components_ref/ref_row_max.{hpp,cpp}.
+// CPU oracle: src/components_ref/cpu_ref_row_max.{hpp,cpp}.
 //
 // WHY ONLY ONE cross-lane shuffle: in the TransposedC layout each lane already
 // holds its M-row's values for 32 of the 64 N-columns, and all 32 lanes in a

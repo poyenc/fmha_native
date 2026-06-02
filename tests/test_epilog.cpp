@@ -19,10 +19,10 @@
 #include <vector>
 
 #include "runner/bf16_utils.hpp"
-#include "components_ref/ref_epilog.hpp"
-#include "components_ref/ref_qk_gemm.hpp"
-#include "components_ref/ref_softmax.hpp"
-#include "components_ref/ref_pv_gemm.hpp"
+#include "components_ref/cpu_ref_epilog.hpp"
+#include "components_ref/cpu_ref_qk_gemm.hpp"
+#include "components_ref/cpu_ref_softmax.hpp"
+#include "components_ref/cpu_ref_pv_gemm.hpp"
 #include "components/epilog.hpp"
 
 static std::string g_golden_full;
@@ -180,24 +180,24 @@ EpilogInput compute_epilog_input(int sq, int sk, int D, float scale_s) {
 
     // GEMM0: S_acc
     std::vector<float> s_acc(kQKOutElems);
-    ref_qk_gemm(hQ.data(), D, sq, hK.data(), D, sk, s_acc.data());
+    cpu_ref_qk_gemm(hQ.data(), D, sq, hK.data(), D, sk, s_acc.data());
 
     // Softmax: P + RSUM
     std::vector<float> p(256 * 32), rmax(256), rsum(256);
-    ref_softmax(s_acc.data(), sk, 0, scale_s, p.data(), rmax.data(), rsum.data());
+    cpu_ref_softmax(s_acc.data(), sk, 0, scale_s, p.data(), rmax.data(), rsum.data());
 
     // GEMM1: O_acc
     std::vector<float> o_acc(kPVOutElems);
-    ref_pv_gemm(p.data(), hV.data(), D, sk, o_acc.data());
+    cpu_ref_pv_gemm(p.data(), hV.data(), D, sk, o_acc.data());
 
     return {std::move(o_acc), std::move(rsum)};
 }
 
-// Compute RSUM from golden S_ACC using ref_softmax (for golden tests only).
+// Compute RSUM from golden S_ACC using cpu_ref_softmax (for golden tests only).
 std::vector<float> compute_rsum_from_sacc(const std::vector<float>& sacc,
                                           int seqlen_k, float scale_s) {
     std::vector<float> p(256 * 32), rmax(256), rsum(256);
-    ref_softmax(sacc.data(), seqlen_k, 0, scale_s, p.data(), rmax.data(), rsum.data());
+    cpu_ref_softmax(sacc.data(), seqlen_k, 0, scale_s, p.data(), rmax.data(), rsum.data());
     return rsum;
 }
 
@@ -212,7 +212,7 @@ TEST(EpilogFullTile, MatchesCpuRef) {
     run_kernel(o_acc, rsum, sq, D, res);
 
     std::vector<float> exp_final(256 * 32), exp_dram(sq * D);
-    ref_epilog(o_acc.data(), rsum.data(), sq, exp_final.data(), exp_dram.data());
+    cpu_ref_epilog(o_acc.data(), rsum.data(), sq, exp_final.data(), exp_dram.data());
 
     compare_tolerance(res.o_final, exp_final, "full/cpuref/o_final");
     compare_exact(res.o_dram, exp_dram, "full/cpuref/o_dram");
@@ -252,7 +252,7 @@ TEST(EpilogPartialTile, MatchesCpuRef) {
     run_kernel(o_acc, rsum, sq, D, res);
 
     std::vector<float> exp_final(256 * 32), exp_dram(sq * D);
-    ref_epilog(o_acc.data(), rsum.data(), sq, exp_final.data(), exp_dram.data());
+    cpu_ref_epilog(o_acc.data(), rsum.data(), sq, exp_final.data(), exp_dram.data());
 
     compare_tolerance(res.o_final, exp_final, "partial/cpuref/o_final");
     compare_exact(res.o_dram, exp_dram, "partial/cpuref/o_dram");
@@ -289,7 +289,7 @@ TEST(EpilogEdge, MinTile) {
     EpilogResult res;
     run_kernel(o_acc, rsum, sq, D, res);
     std::vector<float> exp_final(256*32), exp_dram(sq*D);
-    ref_epilog(o_acc.data(), rsum.data(), sq, exp_final.data(), exp_dram.data());
+    cpu_ref_epilog(o_acc.data(), rsum.data(), sq, exp_final.data(), exp_dram.data());
     compare_tolerance(res.o_final, exp_final, "edge/min/o_final");
     compare_exact(res.o_dram, exp_dram, "edge/min/o_dram");
 }
@@ -300,7 +300,7 @@ TEST(EpilogEdge, FullM0) {
     EpilogResult res;
     run_kernel(o_acc, rsum, sq, D, res);
     std::vector<float> exp_final(256*32), exp_dram(sq*D);
-    ref_epilog(o_acc.data(), rsum.data(), sq, exp_final.data(), exp_dram.data());
+    cpu_ref_epilog(o_acc.data(), rsum.data(), sq, exp_final.data(), exp_dram.data());
     compare_tolerance(res.o_final, exp_final, "edge/fullM0/o_final");
     compare_exact(res.o_dram, exp_dram, "edge/fullM0/o_dram");
 }
@@ -311,7 +311,7 @@ TEST(EpilogEdge, SingleKCol) {
     EpilogResult res;
     run_kernel(o_acc, rsum, sq, D, res);
     std::vector<float> exp_final(256*32), exp_dram(sq*D);
-    ref_epilog(o_acc.data(), rsum.data(), sq, exp_final.data(), exp_dram.data());
+    cpu_ref_epilog(o_acc.data(), rsum.data(), sq, exp_final.data(), exp_dram.data());
     compare_tolerance(res.o_final, exp_final, "edge/singleK/o_final");
     compare_exact(res.o_dram, exp_dram, "edge/singleK/o_dram");
 }

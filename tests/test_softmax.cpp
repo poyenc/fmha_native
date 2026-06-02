@@ -2,8 +2,8 @@
 // UNIT TEST: softmax component (src/components/softmax.hpp), pipeline STAGE 4.
 //
 // What it validates: P, rmax, and rsum from the base-2 softmax. HOW:
-//   - CPU-ref tests build S_acc via ref_qk_gemm, run the kernel, and diff each
-//     output against ref_softmax(). P and rmax are compared EXACTLY (both sides
+//   - CPU-ref tests build S_acc via cpu_ref_qk_gemm, run the kernel, and diff each
+//     output against cpu_ref_softmax(). P and rmax are compared EXACTLY (both sides
 //     use exp2 + truncation); rsum uses a small atol because summation order of
 //     the cross-half merge can differ by ULPs.
 //   - MatchesGolden feeds golden S_ACC (slot 1) and diffs P vs slot 3, rmax vs
@@ -20,8 +20,8 @@
 #include <vector>
 
 #include "runner/bf16_utils.hpp"
-#include "components_ref/ref_softmax.hpp"
-#include "components_ref/ref_qk_gemm.hpp"
+#include "components_ref/cpu_ref_softmax.hpp"
+#include "components_ref/cpu_ref_qk_gemm.hpp"
 #include "components/softmax.hpp"
 
 static std::string g_golden_full;
@@ -159,13 +159,13 @@ TEST(SoftmaxFullTile, MatchesCpuRef) {
     auto hQ = make_Q(sq, D);
     auto hK = make_K(sk, D);
     std::vector<float> s_acc(kQKOutElems);
-    ref_qk_gemm(hQ.data(), D, sq, hK.data(), D, sk, s_acc.data());
+    cpu_ref_qk_gemm(hQ.data(), D, sq, hK.data(), D, sk, s_acc.data());
 
     SoftmaxResult res;
     run_kernel(s_acc, sk, /*kv_offset=*/0, scale_s, res);
 
     std::vector<float> exp_p(256 * 32), exp_rmax(256), exp_rsum(256);
-    ref_softmax(s_acc.data(), sk, 0, scale_s, exp_p.data(), exp_rmax.data(), exp_rsum.data());
+    cpu_ref_softmax(s_acc.data(), sk, 0, scale_s, exp_p.data(), exp_rmax.data(), exp_rsum.data());
 
     compare_exact(res.p, exp_p, "full/cpuref/P");
     compare_exact(res.rmax, exp_rmax, "full/cpuref/rmax");
@@ -203,13 +203,13 @@ TEST(SoftmaxPartialTile, MatchesCpuRef) {
     auto hQ = make_Q(sq, D);
     auto hK = make_K(sk, D);
     std::vector<float> s_acc(kQKOutElems);
-    ref_qk_gemm(hQ.data(), D, sq, hK.data(), D, sk, s_acc.data());
+    cpu_ref_qk_gemm(hQ.data(), D, sq, hK.data(), D, sk, s_acc.data());
 
     SoftmaxResult res;
     run_kernel(s_acc, sk, 0, scale_s, res);
 
     std::vector<float> exp_p(256 * 32), exp_rmax(256), exp_rsum(256);
-    ref_softmax(s_acc.data(), sk, 0, scale_s, exp_p.data(), exp_rmax.data(), exp_rsum.data());
+    cpu_ref_softmax(s_acc.data(), sk, 0, scale_s, exp_p.data(), exp_rmax.data(), exp_rsum.data());
 
     compare_exact(res.p, exp_p, "partial/cpuref/P");
     compare_exact(res.rmax, exp_rmax, "partial/cpuref/rmax");
@@ -242,11 +242,11 @@ TEST(SoftmaxEdge, MinTile) {
     const int sq=1, sk=1, D=64; const float scale_s=0.125f;
     auto hQ=make_Q(sq,D); auto hK=make_K(sk,D);
     std::vector<float> s_acc(kQKOutElems);
-    ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,s_acc.data());
+    cpu_ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,s_acc.data());
     SoftmaxResult res;
     run_kernel(s_acc, sk, 0, scale_s, res);
     std::vector<float> exp_p(256*32), exp_rmax(256), exp_rsum(256);
-    ref_softmax(s_acc.data(), sk, 0, scale_s, exp_p.data(), exp_rmax.data(), exp_rsum.data());
+    cpu_ref_softmax(s_acc.data(), sk, 0, scale_s, exp_p.data(), exp_rmax.data(), exp_rsum.data());
     compare_exact(res.p, exp_p, "edge/min/P");
     compare_exact(res.rmax, exp_rmax, "edge/min/rmax");
 }
@@ -255,11 +255,11 @@ TEST(SoftmaxEdge, FullM0) {
     const int sq=128, sk=64, D=64; const float scale_s=0.125f;
     auto hQ=make_Q(sq,D); auto hK=make_K(sk,D);
     std::vector<float> s_acc(kQKOutElems);
-    ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,s_acc.data());
+    cpu_ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,s_acc.data());
     SoftmaxResult res;
     run_kernel(s_acc, sk, 0, scale_s, res);
     std::vector<float> exp_p(256*32), exp_rmax(256), exp_rsum(256);
-    ref_softmax(s_acc.data(), sk, 0, scale_s, exp_p.data(), exp_rmax.data(), exp_rsum.data());
+    cpu_ref_softmax(s_acc.data(), sk, 0, scale_s, exp_p.data(), exp_rmax.data(), exp_rsum.data());
     compare_exact(res.p, exp_p, "edge/fullM0/P");
     compare_exact(res.rmax, exp_rmax, "edge/fullM0/rmax");
 }
@@ -268,11 +268,11 @@ TEST(SoftmaxEdge, SingleKCol) {
     const int sq=64, sk=1, D=64; const float scale_s=0.125f;
     auto hQ=make_Q(sq,D); auto hK=make_K(sk,D);
     std::vector<float> s_acc(kQKOutElems);
-    ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,s_acc.data());
+    cpu_ref_qk_gemm(hQ.data(),D,sq,hK.data(),D,sk,s_acc.data());
     SoftmaxResult res;
     run_kernel(s_acc, sk, 0, scale_s, res);
     std::vector<float> exp_p(256*32), exp_rmax(256), exp_rsum(256);
-    ref_softmax(s_acc.data(), sk, 0, scale_s, exp_p.data(), exp_rmax.data(), exp_rsum.data());
+    cpu_ref_softmax(s_acc.data(), sk, 0, scale_s, exp_p.data(), exp_rmax.data(), exp_rsum.data());
     compare_exact(res.p, exp_p, "edge/singleK/P");
     compare_exact(res.rmax, exp_rmax, "edge/singleK/rmax");
 }

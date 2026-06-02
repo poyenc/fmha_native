@@ -7,7 +7,7 @@
 //
 // Standalone isolation of the "stage V into LDS" step, used ONLY by
 // tests/test_v_lds.cpp. Golden-verified, NOT #included by src/fused/.
-// CPU oracle: src/components_ref/ref_v_lds.{hpp,cpp}.
+// CPU oracle: src/components_ref/cpu_ref_v_lds.{hpp,cpp}.
 //
 // WHY V needs a shuffle but K does not: GEMM1 contracts over seqk, so V must be
 // laid out in LDS with headdim as the row axis and seqk innermost. The DRAM
@@ -45,7 +45,7 @@
 
 typedef int v2i __attribute__((ext_vector_type(2)));
 
-#include "components_ref/ref_v_lds.hpp"  // kVLdsRegionElems, kVLdsBufBase
+#include "components_ref/cpu_ref_v_lds.hpp"  // kVLdsRegionElems, kVLdsBufBase
 
 __device__ __forceinline__ __amdgpu_buffer_rsrc_t
 vlds_make_srd(const void* base) {

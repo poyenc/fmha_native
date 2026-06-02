@@ -2,8 +2,8 @@
 // UNIT TEST: GEMM1 component (src/components/pv_gemm.hpp), pipeline STAGE 6.
 //
 // What it validates: O_acc = P*V. HOW:
-//   - CPU-ref tests build a real P by chaining ref_qk_gemm -> ref_softmax
-//     (see compute_p), run the kernel, and diff vs ref_pv_gemm() with loose
+//   - CPU-ref tests build a real P by chaining cpu_ref_qk_gemm -> cpu_ref_softmax
+//     (see compute_p), run the kernel, and diff vs cpu_ref_pv_gemm() with loose
 //     tolerance (MFMA vs CPU accumulation order).
 //   - MatchesGolden feeds golden P (slot 3) and diffs O_acc vs slot 5 EXACTLY
 //     (same golden P drives both, so the only variable is the GPU matmul).
@@ -19,9 +19,9 @@
 #include <vector>
 
 #include "runner/bf16_utils.hpp"
-#include "components_ref/ref_pv_gemm.hpp"
-#include "components_ref/ref_qk_gemm.hpp"
-#include "components_ref/ref_softmax.hpp"
+#include "components_ref/cpu_ref_pv_gemm.hpp"
+#include "components_ref/cpu_ref_qk_gemm.hpp"
+#include "components_ref/cpu_ref_softmax.hpp"
 #include "components/pv_gemm.hpp"
 
 static std::string g_golden_full;
@@ -45,14 +45,14 @@ std::vector<uint16_t> make_V(int seqlen, int D) {
     return v;
 }
 
-// Compute P from S_acc using ref_softmax (returns bf16-promoted fp32)
+// Compute P from S_acc using cpu_ref_softmax (returns bf16-promoted fp32)
 std::vector<float> compute_p(int sq, int sk, int D) {
     auto hQ = make_Q(sq, D);
     auto hK = make_K(sk, D);
     std::vector<float> s_acc(kQKOutElems);
-    ref_qk_gemm(hQ.data(), D, sq, hK.data(), D, sk, s_acc.data());
+    cpu_ref_qk_gemm(hQ.data(), D, sq, hK.data(), D, sk, s_acc.data());
     std::vector<float> p(256 * 32), rmax(256), rsum(256);
-    ref_softmax(s_acc.data(), sk, 0, 0.125f, p.data(), rmax.data(), rsum.data());
+    cpu_ref_softmax(s_acc.data(), sk, 0, 0.125f, p.data(), rmax.data(), rsum.data());
     return p;
 }
 
@@ -150,7 +150,7 @@ TEST(PvGemmFullTile, MatchesCpuRef) {
     std::vector<float> got;
     run_kernel(p, hV, D, sk, got);
     std::vector<float> exp(kPVOutElems);
-    ref_pv_gemm(p.data(), hV.data(), D, sk, exp.data());
+    cpu_ref_pv_gemm(p.data(), hV.data(), D, sk, exp.data());
     compare(got, exp, "full/cpuref");
 }
 
@@ -174,7 +174,7 @@ TEST(PvGemmPartialTile, MatchesCpuRef) {
     std::vector<float> got;
     run_kernel(p, hV, D, sk, got);
     std::vector<float> exp(kPVOutElems);
-    ref_pv_gemm(p.data(), hV.data(), D, sk, exp.data());
+    cpu_ref_pv_gemm(p.data(), hV.data(), D, sk, exp.data());
     compare(got, exp, "partial/cpuref");
 }
 
@@ -199,7 +199,7 @@ TEST(PvGemmEdge, MinTile) {
     std::vector<float> got;
     run_kernel(p,hV,D,sk,got);
     std::vector<float> exp(kPVOutElems);
-    ref_pv_gemm(p.data(),hV.data(),D,sk,exp.data());
+    cpu_ref_pv_gemm(p.data(),hV.data(),D,sk,exp.data());
     compare(got,exp,"edge/min");
 }
 
@@ -209,7 +209,7 @@ TEST(PvGemmEdge, FullM0) {
     std::vector<float> got;
     run_kernel(p,hV,D,sk,got);
     std::vector<float> exp(kPVOutElems);
-    ref_pv_gemm(p.data(),hV.data(),D,sk,exp.data());
+    cpu_ref_pv_gemm(p.data(),hV.data(),D,sk,exp.data());
     compare(got,exp,"edge/fullM0");
 }
 
@@ -219,7 +219,7 @@ TEST(PvGemmEdge, SingleKCol) {
     std::vector<float> got;
     run_kernel(p,hV,D,sk,got);
     std::vector<float> exp(kPVOutElems);
-    ref_pv_gemm(p.data(),hV.data(),D,sk,exp.data());
+    cpu_ref_pv_gemm(p.data(),hV.data(),D,sk,exp.data());
     compare(got,exp,"edge/singleK");
 }
 

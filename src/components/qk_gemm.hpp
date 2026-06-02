@@ -7,7 +7,7 @@
 //
 // Standalone isolation of attention's first matmul, used ONLY by
 // tests/test_qk_gemm.cpp. Golden-verified, NOT #included by src/fused/.
-// CPU oracle: src/components_ref/ref_qk_gemm.{hpp,cpp}.
+// CPU oracle: src/components_ref/cpu_ref_qk_gemm.{hpp,cpp}.
 //
 // MENTAL MODEL of the output layout (shared across ALL components — learn it
 // once here):

@@ -27,4 +27,4 @@
 constexpr int kRowMaxOutElems = 256;
 
 // Fill `rmax` (256 floats) with expected row-max values.
-void ref_row_max(const float* s_acc, float* rmax);
+void cpu_ref_row_max(const float* s_acc, float* rmax);

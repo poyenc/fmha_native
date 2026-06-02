@@ -32,7 +32,7 @@
 constexpr int kSoftmaxOutRegs = 32;   // P regs per thread
 constexpr int kSoftmaxNThreads = 256;
 
-void ref_softmax(const float* s_acc,
+void cpu_ref_softmax(const float* s_acc,
                  int seqlen_k, int kv_offset,
                  float scale_s,
                  float* p_out,      // [256*32] bf16-promoted fp32

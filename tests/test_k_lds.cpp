@@ -3,7 +3,7 @@
 //
 // What it validates: the GPU's swizzled DRAM->LDS K staging lands every element
 // in the right LDS slot. HOW:
-//   1. MatchesCpuRef — kernel's dumped LDS region vs ref_k_lds() image, BYTE
+//   1. MatchesCpuRef — kernel's dumped LDS region vs cpu_ref_k_lds() image, BYTE
 //      exact (uint16 bf16 compare). Always runs.
 //   2. MatchesGolden — vs CK dump_lds.bin slot 0 (K_LDS), exact. Note the
 //      golden stores each bf16 widened to fp32 at index (bufferBase + offset),
@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "runner/bf16_utils.hpp"
-#include "components_ref/ref_k_lds.hpp"
+#include "components_ref/cpu_ref_k_lds.hpp"
 #include "components/k_lds.hpp"
 
 // Optional golden directory (set via --golden=<dir>). Empty => skip golden check.
@@ -88,7 +88,7 @@ void check_vs_cpu_ref(const std::vector<uint16_t>& kern,
                       const std::vector<uint16_t>& h_K,
                       int stride_k, int kv_offset, int seqlen_k) {
     std::vector<uint16_t> expected(kKLdsRegionElems);
-    ref_k_lds(h_K.data(), stride_k, kv_offset, seqlen_k, expected.data());
+    cpu_ref_k_lds(h_K.data(), stride_k, kv_offset, seqlen_k, expected.data());
 
     int mism = 0, shown = 0;
     for (int e = 0; e < kKLdsRegionElems; ++e) {

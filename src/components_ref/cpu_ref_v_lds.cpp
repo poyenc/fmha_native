@@ -1,7 +1,7 @@
-#include "components_ref/ref_v_lds.hpp"
+#include "components_ref/cpu_ref_v_lds.hpp"
 #include <cstring>
 
-void ref_v_lds(const uint16_t* V,
+void cpu_ref_v_lds(const uint16_t* V,
                int stride_v,
                int kv_offset,
                int seqlen_k,

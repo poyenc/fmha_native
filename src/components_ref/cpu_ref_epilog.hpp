@@ -28,7 +28,7 @@ inline int epilog_swz(int x) {
 // Compute O_final (normalized, fp32) and DRAM output (bf16-promoted fp32).
 // o_final: [256*32] fp32 (for golden slot 6 comparison)
 // o_dram:  [seqlen_q*64] fp32 bf16-promoted (for o_dram.bin comparison)
-void ref_epilog(const float* o_acc,     // [256*32]
+void cpu_ref_epilog(const float* o_acc,     // [256*32]
                 const float* rsum,      // [256]
                 int seqlen_q,
                 float* o_final,         // [256*32]

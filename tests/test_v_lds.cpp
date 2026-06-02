@@ -3,7 +3,7 @@
 //
 // What it validates: the load + v_perm transpose + ds_write staging of one
 // 32-row V slice into LDS. HOW:
-//   1. MatchesCpuRef — kernel's dumped LDS vs ref_v_lds() image, BYTE exact.
+//   1. MatchesCpuRef — kernel's dumped LDS vs cpu_ref_v_lds() image, BYTE exact.
 //   2. MatchesGolden — vs CK dump_lds.bin slot 1 (V_LDS, starts at float index
 //      8192). Compares only valid data slots. SKIPS without a golden dir.
 // V uses a distinct golden formula (v[i] = (i%256)/256 + 1) so V_LDS bugs can't
@@ -18,7 +18,7 @@
 #include <vector>
 
 #include "runner/bf16_utils.hpp"
-#include "components_ref/ref_v_lds.hpp"
+#include "components_ref/cpu_ref_v_lds.hpp"
 #include "components/v_lds.hpp"
 
 static std::string g_golden_full;
@@ -82,7 +82,7 @@ void check_vs_cpu_ref(const std::vector<uint16_t>& kern,
                       const std::vector<uint16_t>& h_V,
                       int stride_v, int kv_offset, int seqlen_k) {
     std::vector<uint16_t> expected(kVLdsRegionElems);
-    ref_v_lds(h_V.data(), stride_v, kv_offset, seqlen_k, expected.data());
+    cpu_ref_v_lds(h_V.data(), stride_v, kv_offset, seqlen_k, expected.data());
 
     int mism = 0, shown = 0;
     for (int e = 0; e < kVLdsRegionElems; ++e) {

@@ -7,7 +7,7 @@
 //
 // Standalone isolation of the full single-tile softmax, used ONLY by
 // tests/test_softmax.cpp. Golden-verified, NOT #included by src/fused/.
-// CPU oracle: src/components_ref/ref_softmax.{hpp,cpp}.
+// CPU oracle: src/components_ref/cpu_ref_softmax.{hpp,cpp}.
 //
 // KEY NUMERICS for newcomers:
 //   - This GPU path is BASE-2: P = exp2(scale_s*log2(e) * (S - rmax)). The
@@ -15,7 +15,7 @@
 //     2^x). CK runs with FAST_EXP2=1, hence exp2 instead of expf.
 //   - Folding log2(e) into the scale converts the natural-e softmax into the
 //     base-2 domain WITHOUT changing the probabilities (exp(x)=exp2(x*log2 e)).
-//     The CPU oracle (ref_softmax.cpp) uses exp2f too, so they agree exactly;
+//     The CPU oracle (cpu_ref_softmax.cpp) uses exp2f too, so they agree exactly;
 //     note the *full-kernel* CPU references elsewhere use natural expf instead.
 //   - bf16 cast of P = TRUNCATION (keep upper 16 bits), not round-to-nearest.
 //   - rmax/rsum each use ONE cross-half ds_bpermute, same trick as row_max.

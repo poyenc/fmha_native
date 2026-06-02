@@ -1,4 +1,4 @@
-#include "components_ref/ref_softmax.hpp"
+#include "components_ref/cpu_ref_softmax.hpp"
 #include "runner/bf16_utils.hpp"
 #include <cmath>
 #include <algorithm>
@@ -13,7 +13,7 @@ static int softmax_n_col(int tid, int r) {
     return (r / 8) * 16 + k_sub * 8 + (r % 8);
 }
 
-void ref_softmax(const float* s_acc,
+void cpu_ref_softmax(const float* s_acc,
                  int seqlen_k, int kv_offset,
                  float scale_s,
                  float* p_out,

@@ -32,6 +32,6 @@ inline int qk_ref_n_col(int tid, int r) {
 }
 
 // Fill `out` (kQKOutElems floats) with expected S_acc values.
-void ref_qk_gemm(const uint16_t* Q, int stride_q, int seqlen_q,
+void cpu_ref_qk_gemm(const uint16_t* Q, int stride_q, int seqlen_q,
                  const uint16_t* K, int stride_k, int seqlen_k,
                  float* out);

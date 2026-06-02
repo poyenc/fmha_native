@@ -46,7 +46,7 @@ constexpr int kVLdsBufBase = 2304; // buffer_base for chunk 0
 // Fill `expected_lds` (uint16 bf16 image, kVLdsRegionElems entries) with the
 // staged V tile. `V` is raw bf16 row-major [seqlen_k, D=64], stride_v elements.
 // kv_offset = seqlen_k base row of this tile.
-void ref_v_lds(const uint16_t* V,
+void cpu_ref_v_lds(const uint16_t* V,
                int stride_v,
                int kv_offset,
                int seqlen_k,

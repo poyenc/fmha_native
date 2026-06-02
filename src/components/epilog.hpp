@@ -7,7 +7,7 @@
 //
 // Standalone isolation of the output epilogue, used ONLY by
 // tests/test_epilog.cpp. Golden-verified, NOT #included by src/fused/.
-// CPU oracle: src/components_ref/ref_epilog.{hpp,cpp}.
+// CPU oracle: src/components_ref/cpu_ref_epilog.{hpp,cpp}.
 //
 // WHAT it does: divide the raw GEMM1 accumulator O_acc by the softmax row-sum
 // RSUM (the deferred normalization of flash attention), truncate to bf16, and

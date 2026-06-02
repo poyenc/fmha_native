@@ -7,7 +7,7 @@
 //
 // Standalone isolation of attention's second matmul, used ONLY by
 // tests/test_pv_gemm.cpp. Golden-verified, NOT #included by src/fused/.
-// CPU oracle: src/components_ref/ref_pv_gemm.{hpp,cpp}.
+// CPU oracle: src/components_ref/cpu_ref_pv_gemm.{hpp,cpp}.
 //
 // CONTRAST WITH GEMM0 — read this if GEMM0 already makes sense:
 //   - Same CK convention (A=LDS, B=reg) and same HW arg swap, but here

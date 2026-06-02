@@ -68,43 +68,43 @@ target_link_options(test_fmha_fwd_d64 PRIVATE -fopenmp)
 set_source_files_properties(tests/test_fmha_fwd_d64.cpp PROPERTIES LANGUAGE HIP)
 
 # Test: K LDS staging (Phase 1 Kernel 1)
-add_executable(test_k_lds tests/test_k_lds.cpp src/components_ref/ref_k_lds.cpp)
+add_executable(test_k_lds tests/test_k_lds.cpp src/components_ref/cpu_ref_k_lds.cpp)
 target_link_libraries(test_k_lds PRIVATE fmha_runner GTest::gtest)
 set_source_files_properties(tests/test_k_lds.cpp PROPERTIES LANGUAGE HIP
     COMPILE_FLAGS "--offload-arch=${GPU_TARGET} --save-temps")
 
 # Test: QK GEMM (Phase 1 Kernel 2)
-add_executable(test_qk_gemm tests/test_qk_gemm.cpp src/components_ref/ref_qk_gemm.cpp)
+add_executable(test_qk_gemm tests/test_qk_gemm.cpp src/components_ref/cpu_ref_qk_gemm.cpp)
 target_link_libraries(test_qk_gemm PRIVATE fmha_runner GTest::gtest)
 set_source_files_properties(tests/test_qk_gemm.cpp PROPERTIES LANGUAGE HIP
     COMPILE_FLAGS "--offload-arch=${GPU_TARGET} --save-temps")
 
 # Test: Row Max (Phase 1 Kernel 3)
-add_executable(test_row_max tests/test_row_max.cpp src/components_ref/ref_row_max.cpp src/components_ref/ref_qk_gemm.cpp)
+add_executable(test_row_max tests/test_row_max.cpp src/components_ref/cpu_ref_row_max.cpp src/components_ref/cpu_ref_qk_gemm.cpp)
 target_link_libraries(test_row_max PRIVATE fmha_runner GTest::gtest)
 set_source_files_properties(tests/test_row_max.cpp PROPERTIES LANGUAGE HIP
     COMPILE_FLAGS "--offload-arch=${GPU_TARGET} --save-temps")
 
 # Test: Softmax (Phase 1 Kernel 4)
-add_executable(test_softmax tests/test_softmax.cpp src/components_ref/ref_softmax.cpp src/components_ref/ref_qk_gemm.cpp)
+add_executable(test_softmax tests/test_softmax.cpp src/components_ref/cpu_ref_softmax.cpp src/components_ref/cpu_ref_qk_gemm.cpp)
 target_link_libraries(test_softmax PRIVATE fmha_runner GTest::gtest)
 set_source_files_properties(tests/test_softmax.cpp PROPERTIES LANGUAGE HIP
     COMPILE_FLAGS "--offload-arch=${GPU_TARGET} --save-temps")
 
 # Test: V LDS staging (Phase 1 Kernel 5)
-add_executable(test_v_lds tests/test_v_lds.cpp src/components_ref/ref_v_lds.cpp)
+add_executable(test_v_lds tests/test_v_lds.cpp src/components_ref/cpu_ref_v_lds.cpp)
 target_link_libraries(test_v_lds PRIVATE fmha_runner GTest::gtest)
 set_source_files_properties(tests/test_v_lds.cpp PROPERTIES LANGUAGE HIP
     COMPILE_FLAGS "--offload-arch=${GPU_TARGET} --save-temps")
 
 # Test: PV GEMM (Phase 1 Kernel 6)
-add_executable(test_pv_gemm tests/test_pv_gemm.cpp src/components_ref/ref_pv_gemm.cpp src/components_ref/ref_qk_gemm.cpp src/components_ref/ref_softmax.cpp)
+add_executable(test_pv_gemm tests/test_pv_gemm.cpp src/components_ref/cpu_ref_pv_gemm.cpp src/components_ref/cpu_ref_qk_gemm.cpp src/components_ref/cpu_ref_softmax.cpp)
 target_link_libraries(test_pv_gemm PRIVATE fmha_runner GTest::gtest)
 set_source_files_properties(tests/test_pv_gemm.cpp PROPERTIES LANGUAGE HIP
     COMPILE_FLAGS "--offload-arch=${GPU_TARGET} --save-temps")
 
 # Test: Epilog (Phase 1 Kernel 7)
-add_executable(test_epilog tests/test_epilog.cpp src/components_ref/ref_epilog.cpp src/components_ref/ref_qk_gemm.cpp src/components_ref/ref_softmax.cpp src/components_ref/ref_pv_gemm.cpp)
+add_executable(test_epilog tests/test_epilog.cpp src/components_ref/cpu_ref_epilog.cpp src/components_ref/cpu_ref_qk_gemm.cpp src/components_ref/cpu_ref_softmax.cpp src/components_ref/cpu_ref_pv_gemm.cpp)
 target_link_libraries(test_epilog PRIVATE fmha_runner GTest::gtest)
 set_source_files_properties(tests/test_epilog.cpp PROPERTIES LANGUAGE HIP
     COMPILE_FLAGS "--offload-arch=${GPU_TARGET} --save-temps")

@@ -241,8 +241,17 @@ TEST(CombineSynthetic, AdversarialPatterns) {
 
                 for (int d = 0; d < kD; ++d) {
                     // Distinct, well-separated per-(g,d) partials so a wrong
-                    // weight assignment is visible in the combined output.
-                    float val = (next() - 0.5f) * 4.0f + 0.1f * g + 0.01f * d;
+                    // weight assignment is visible in the combined output. The
+                    // 0.01 factor keeps the COMBINED output in the realistic
+                    // attention-output range (O(0.01-0.05)), where the final
+                    // bf16 store rounding is genuinely < 1e-3 — matching the
+                    // Source-A tolerance below. (At O(1) magnitudes bf16 store
+                    // resolution alone is ~0.016-0.03, which would swamp any
+                    // 1e-3 abs check and make this test unsatisfiable for ANY
+                    // correct bf16-storing combine; the weight-separation that
+                    // makes a wrong reweight visible is preserved because it
+                    // scales with the data.)
+                    float val = ((next() - 0.5f) * 4.0f + 0.1f * g + 0.01f * d) * 0.01f;
                     scratch_o[scratch_o_idx(g, 0, 0, r, d, B, Hq, Sq)] = val;
                 }
             }

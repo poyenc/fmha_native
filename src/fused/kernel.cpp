@@ -1,5 +1,6 @@
 #include "runner/params.hpp"
 #include "fused/pipeline.hpp"
+#include "fused/op_combine.hpp"   // split-K combine device worker
 
 // ================================================================
 // kernel.cpp — the four __global__ launch entry points
@@ -96,4 +97,17 @@ fmha_fwd_d64_bf16_msk1_varlen(FmhaFwdParams params) {
     const int m_tile_idx = gridDim.y - 1 - blockIdx.y;
     const int batch_idx = blockIdx.z;
     fmha_fwd_d64_device<true, true>(params, lds, batch_idx, head_idx, m_tile_idx);
+}
+
+// ================================================================
+// Split-K COMBINE entry (fmha_fwd_d64_bf16_combine)
+// ================================================================
+//   The second pass of split-K: reweights the G per-split fp32 partials into the
+//   single global-softmax output and stores the final BF16 O. Unlike the four
+//   forward entries above, this needs NO LDS pipeline — it is a cheap row-wise
+//   reduction. The grid mirrors the forward kernel: dim3(nhead_q, m_tiles, batch),
+//   so the same blockIdx decode applies (h=x, m_tile=y, b=z). See op_combine.hpp.
+__global__ void __launch_bounds__(kBlockSize)
+fmha_fwd_d64_bf16_combine(FmhaFwdCombineParams params) {
+    combine_split(params, blockIdx.z, blockIdx.x, blockIdx.y);
 }

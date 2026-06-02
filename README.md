@@ -87,31 +87,58 @@ Non-causal (`--mask 0`):
 
 | B | H | S | native | CK | native/CK |
 |---|---|------|------|------|------|
-| 8 | 16 | 1024  | 302.0 | 313.1 | 96.5% |
-| 4 | 16 | 2048  | 348.4 | 350.3 | 99.5% |
-| 2 | 16 | 4096  | 371.6 | 374.5 | 99.2% |
-| 1 | 8  | 8192  | 335.9 | 346.3 | 97.0% |
-| 1 | 16 | 8192  | 387.9 | 392.5 | 98.8% |
-| 1 | 8  | 16384 | 406.5 | 412.5 | 98.6% |
-| 1 | 4  | 32768 | 404.9 | 411.1 | 98.5% |
-| 1 | 2  | 40000 | 335.1 | 342.5 | 97.8% |
+| 8 | 16 | 1024  | 309.0 | 308.8 | 100.1% |
+| 4 | 16 | 2048  | 347.1 | 352.7 | 98.4% |
+| 2 | 16 | 4096  | 375.2 | 373.7 | 100.4% |
+| 1 | 8  | 8192  | 339.1 | 347.5 | 97.6% |
+| 1 | 16 | 8192  | 390.6 | 390.6 | 100.0% |
+| 1 | 8  | 16384 | 406.8 | 412.6 | 98.6% |
+| 1 | 4  | 32768 | 405.6 | 409.4 | 99.1% |
+| 1 | 2  | 40000 | 335.9 | 341.2 | 98.5% |
 
 Causal (`--mask 1`, ×0.5 FLOP convention):
 
 | B | H | S | native | CK | native/CK |
 |---|---|------|------|------|------|
-| 8 | 16 | 1024  | 207.8 | 223.8 | 92.9% |
-| 4 | 16 | 2048  | 265.6 | 286.1 | 92.8% |
-| 2 | 16 | 4096  | 305.8 | 305.4 | 100.1% |
-| 1 | 8  | 8192  | 256.2 | 250.1 | 102.4% |
-| 1 | 16 | 8192  | 358.1 | 361.5 | 99.1% |
-| 1 | 8  | 16384 | 378.9 | 377.2 | 100.4% |
-| 1 | 4  | 32768 | 395.8 | 393.8 | 100.5% |
-| 1 | 2  | 40000 | 308.2 | 243.5 | 126.5% |
+| 8 | 16 | 1024  | 209.7 | 223.3 | 93.9% |
+| 4 | 16 | 2048  | 264.9 | 283.9 | 93.3% |
+| 2 | 16 | 4096  | 305.2 | 308.8 | 98.8% |
+| 1 | 8  | 8192  | 256.3 | 249.5 | 102.7% |
+| 1 | 16 | 8192  | 360.7 | 358.8 | 100.5% |
+| 1 | 8  | 16384 | 377.3 | 374.4 | 100.8% |
+| 1 | 4  | 32768 | 395.6 | 394.7 | 100.2% |
+| 1 | 2  | 40000 | 309.6 | 241.0 | 128.5% |
 
 TFLOPS are in TFLOP/s. The `B1 H2 S40000` causal config is ragged/low-occupancy (CK regresses
 there) — treat it as an outlier. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §5 for why
 causal closed to ~97% (the M-tile load-balance fix).
+
+### Split-K (flash-decoding) — `B1 H2 S40000`, non-causal
+
+The `B1 H2 S40000` shape is work-starved single-pass (only 2 batch×head groups → ~2 blocks/CU on
+304 CUs), so neither native single-pass nor CK saturates the GPU. Opt-in split-K (`--splitk G`)
+partitions the 625-tile KV reduction across `G` blocks per (head, M-tile) and a combine pass
+reweights the partials — a structural parallelism win neither single-pass kernel has. Measured on
+**MI300X (gfx942)**, mask=0, via `scripts/run-benchmark-s40k-gsweep.sh` (native) and the CK script
+above, same idle GPU + 6-run framework:
+
+| Config | native TFLOPS | vs single-pass | native/CK |
+|---|---|---|---|
+| CK (single-pass) | 341.2 | — | reference |
+| native single-pass | 335.2 | +0.0% | 98.2% |
+| split-K G=1 | 330.8 | −1.3% | 96.9% |
+| split-K G=4 | 424.5 | +26.6% | 124.4% |
+| **split-K G=8** | **431.8** | **+28.8%** | **126.6%** |
+| split-K G=16 | 411.9 | +22.9% | 120.7% |
+
+Native single-pass ties CK (98.2%); split-K at the **G=8** sweet spot reaches **431.8 TFLOPS =
+126.6% of CK** (+28.8% over its own baseline). G=1 is slightly below baseline (combine-launch
+overhead with no parallelism gain); G=16 over-splits. Split-K is bench/opt-in only (the default
+dispatch is unchanged). See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design.
+
+```bash
+./scripts/run-benchmark-s40k-gsweep.sh --mask 0    # sweeps G = 0,1,4,8,16
+```
 
 ## Benchmark
 

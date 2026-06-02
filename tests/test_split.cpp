@@ -1298,6 +1298,218 @@ TEST(SplitInvariant, KvPermutationInvariance_Mask0) {
     EXPECT_LT(m, 6.5e-5f) << "O changed under KV permutation (order-invariance broken)";
 }
 
+// ===========================================================================
+// ANALYTIC #3a — Constant scores ⇒ uniform softmax ⇒ O == mean(V over keys).
+//
+// WHY THIS IS THE STRONGEST KIND OF TEST: every test above (even the oracle-free
+// invariants #2a/#2b) ultimately trusts that SOME computation — ours or the
+// pipeline's — is the right one; the invariants only check internal consistency.
+// This test instead constructs an input whose CORRECT output is known by pure
+// ARITHMETIC from the input bytes, trusting ZERO oracle implementation.  If the
+// pipeline disagrees with hand arithmetic over h_V, the pipeline is wrong.
+//
+// THE ANALYTIC CONSTRUCTION (equal K ⇒ uniform softmax ⇒ O == mean V):
+//   The attention output for query row r is  O[r] = Σ_s softmax_s(score) · V[s],
+//   with score(r,s) = scale · (Q[r] · K[s]).  If EVERY key vector is identical,
+//   K[s] == K0 for all s, then score(r,s) = scale · (Q[r] · K0) is the SAME
+//   value for every key s (it does not depend on s at all).  A softmax over a
+//   constant vector is exactly uniform: softmax_s = 1/Skv for every s.  Hence
+//       O[r][d] = (1/Skv) · Σ_s V[s][d]  =  mean over keys of V  — independent of
+//   the query row r AND of Q entirely.  We therefore leave Q random (the stronger
+//   test: the result must be the V-mean for EVERY distinct query row), make all K
+//   rows equal (per b, per kv-head, copy row 0 into every row), leave V random,
+//   and compare the pipeline O to the arithmetic mean of the bf16 V rows.
+//
+// WHY IT SURVIVES SPLIT + COMBINE: split-K hands split g the disjoint key range
+// of size n_g (Σ_g n_g = Skv).  Within that range every key is still K0, so the
+// split's local softmax is uniform over its n_g keys ⇒ its partial O_g is the
+// mean of THAT range's V rows, and its (natural-log) LSE_g = log(n_g) + score
+// (the per-key score is the same scalar for all keys, so the local log-sum-exp is
+// log(n_g) plus that scalar).  The combine reweights split g by
+//   w_g = exp(LSE_g − LSE*) / Σ_h exp(LSE_h − LSE*) = n_g / Σ_h n_h = n_g / Skv,
+// because the shared per-key scalar cancels in the ratio.  So combine forms
+//   Σ_g (n_g/Skv) · mean_{s∈g} V[s]  =  (1/Skv) Σ_s V[s]  =  the GLOBAL V-mean,
+// independent of G and of the partition boundaries — exactly the analytic target.
+//
+// gqa=1 and Hkv==Hq here, so query head h reads kv-head h 1:1; the V-mean for
+// output head h uses kv-head h's V rows.
+//
+// TOLERANCE SOURCE: the pipeline carries the uniform weight 1/Skv through the
+// bf16 P-GEMM (the probabilities are truncated to bf16 before the P·V matmul) and
+// finally truncates O to bf16 on store.  Both are ~2^-8 relative at the V
+// magnitude (~0.1), so a sub-1e-3 absolute drift from the exact fp32 mean is the
+// expected, benign noise floor; a real math/wiring bug overshoots it massively.
+// ===========================================================================
+TEST(SplitAnalytic, ConstantScoresMeanV_Mask0) {
+    FmhaParams p{};
+    p.batch = 1; p.q_heads = 2; p.kv_heads = 2; p.gqa = 1;
+    // kv_seq_len=512 ⇒ 8 kN0(=64) tiles: divides cleanly for both G=2 and G=8.
+    p.seq_len = 256; p.kv_seq_len = 512; p.head_dim = kD; p.mask = 0;
+
+    const int B = p.batch, Hq = p.q_heads, Hkv = p.kv_heads;
+    const int Sq = p.seq_len, Skv = p.kv_seq_len;
+    const int Dpad = p.hdim_dispatch();   // 64; no padding columns
+
+    FmhaBuffers bufs(p);
+    bufs.fill_random(31415);
+
+    // Make every key row equal to that (b,kv-head)'s row 0 (in place, on host,
+    // before upload).  Leaving V random keeps the V-mean a non-trivial target.
+    for (int b = 0; b < B; ++b)
+    for (int h = 0; h < Hkv; ++h) {
+        const size_t base = ((size_t)(b * Hkv + h) * Skv) * Dpad;
+        for (int s = 1; s < Skv; ++s)
+            for (int d = 0; d < kD; ++d)
+                bufs.h_K[base + (size_t)s * Dpad + d] = bufs.h_K[base + 0 * Dpad + d];
+    }
+    bufs.copy_to_device();
+    FmhaFwdParams base = make_base_params(p, bufs);
+
+    // ANALYTIC TARGET (zero oracle): expected[b][h][d] = mean over keys of the
+    // bf16-decoded V rows.  Accumulate in fp64 to keep the target itself exact.
+    std::vector<float> expected((size_t)B * Hq * kD);
+    for (int b = 0; b < B; ++b)
+    for (int h = 0; h < Hkv; ++h) {
+        const size_t base = ((size_t)(b * Hkv + h) * Skv) * Dpad;
+        for (int d = 0; d < kD; ++d) {
+            double acc = 0.0;
+            for (int s = 0; s < Skv; ++s)
+                acc += bf16_to_float(bufs.h_V[base + (size_t)s * Dpad + d]);
+            // gqa=1, Hkv==Hq ⇒ output head h maps to kv-head h 1:1.
+            expected[((size_t)(b * Hq + h)) * kD + d] = (float)(acc / Skv);
+        }
+    }
+
+    for (int G : {2, 8}) {
+        std::vector<float> o = run_pipe_o(/*mask=*/false, base, {G, B, Hq, Sq});
+        float max_abs = 0.0f;
+        for (int b = 0; b < B; ++b)
+        for (int h = 0; h < Hq; ++h)
+        for (int row = 0; row < Sq; ++row)
+            for (int d = 0; d < kD; ++d) {
+                const float got = o[(((size_t)(b * Hq + h) * Sq + row) * kD) + d];
+                const float exp = expected[((size_t)(b * Hq + h)) * kD + d];
+                max_abs = std::max(max_abs, std::fabs(got - exp));
+            }
+        fprintf(stderr, "[SplitAnalytic.ConstantScoresMeanV_Mask0 G=%d] max_abs=%.6g\n",
+                G, max_abs);
+        // MEASURED on gfx942: max_abs = 3.03201e-05 for BOTH G=2 and G=8 (the
+        // value is G-independent because the combine reconstructs the SAME global
+        // mean regardless of partition).  The target itself is small: a mean of
+        // 512 values in [-0.1,0.1] has magnitude ~0.004, so ~one bf16 ULP there
+        // is 2^-8 · 0.004 ≈ 1.6e-5; the observed ~3e-5 is that bf16-P + bf16-O
+        // store noise floor (a couple of ULP).  FINAL bound = 6.5e-5 (~2x the
+        // observed 3.03e-5, far under the 2e-3 ceiling for the bf16-P store
+        // class).  A real bug (wrong weight / wrong V mean) overshoots this by
+        // orders of magnitude.
+        EXPECT_LT(max_abs, 6.5e-5f)
+            << "pipeline O != arithmetic mean(V), G=" << G;
+    }
+}
+
+// ===========================================================================
+// ANALYTIC #3b — One dominant key ⇒ O ≈ that key's V row.  [BEST-EFFORT]
+//
+// Like #3a, the target is known by ARITHMETIC from the input bytes (it is one
+// specific V row), trusting zero oracle.  The construction forces a single key
+// j* to win the softmax so overwhelmingly that its weight ≈ 1 and O ≈ V[j*].
+//
+// THE ARITHMETIC (why j* dominates).  Set Q := +0.5 (all rows, all 64 cols),
+// every K row := −0.5 EXCEPT row j* := +4.0; V stays random.  With the
+// log2e-folded scale = 1.4426950408889634/8 = 0.18033688 the per-key score is
+//   score(j*)    = scale · Σ_d Q·K[j*]  = 0.18033688 · 64 · (0.5·4.0)  = 23.08
+//   score(other) = scale · Σ_d Q·K[s]   = 0.18033688 · 64 · (0.5·−0.5) = −2.885
+// The kernel softmax is BASE-2 (exp2), so the weight ratio of j* to any other key
+//   = 2^(score(j*) − score(other)) = 2^(23.08 − (−2.885)) = 2^25.96 ≈ 6.4e7.
+// With ~511 non-dominant keys the total non-dominant mass ≈ 511 / 6.4e7 ≈ 8e-6,
+// so weight(j*) ≈ 0.999992 and O ≈ V[j*] to ~8e-6 · (V spread) — far below bf16.
+// 0.5, −0.5, 4.0 are all bf16-exact, so the constants store losslessly.
+//
+// j* = 137 lands in kN0(=64) tile 2 (137/64 = 2).  For G=2 (T=ceil(8/2)=4 tiles
+// per split ⇒ tile 2 ∈ split 0) and G=4 (T=2 ⇒ tile 2 ∈ split 1) the dominant
+// key falls in DIFFERENT splits, so this also exercises split routing + the
+// LSE-based combine weighting (the winning split must dominate the reweight).
+//
+// TOLERANCE SOURCE: residual non-dominant mass (~8e-6 · V-spread, negligible) +
+// the bf16 store of O at V-magnitude ~0.1 (~4e-4).  BEST-EFFORT: if the measured
+// max_abs is unstable across G or exceeds 2e-3, this test is DROPPED (the bf16 +
+// base-2 regime is too coarse to pin a single row), never loosened past 2e-3.
+// ===========================================================================
+TEST(SplitAnalytic, OneDominantKey_Mask0) {
+    FmhaParams p{};
+    p.batch = 1; p.q_heads = 2; p.kv_heads = 2; p.gqa = 1;
+    // seq_len=128 ⇒ exactly 1 m-tile; kv_seq_len=512 ⇒ 8 kN0 tiles.
+    p.seq_len = 128; p.kv_seq_len = 512; p.head_dim = kD; p.mask = 0;
+
+    const int B = p.batch, Hq = p.q_heads, Hkv = p.kv_heads;
+    const int Sq = p.seq_len, Skv = p.kv_seq_len;
+    const int Dpad = p.hdim_dispatch();   // 64
+    const int jstar = 137;                 // dominant key (tile 2)
+
+    FmhaBuffers bufs(p);
+    bufs.fill_random(27182);
+
+    // bf16-exact constants for the dominant-key construction.
+    const uint16_t bf_qpos  = float_to_bf16(0.5f);
+    const uint16_t bf_kneg  = float_to_bf16(-0.5f);
+    const uint16_t bf_kdom  = float_to_bf16(4.0f);
+
+    // Q := +0.5 everywhere (all rows, all 64 cols).
+    for (int b = 0; b < B; ++b)
+    for (int h = 0; h < Hq; ++h) {
+        const size_t base = ((size_t)(b * Hq + h) * Sq) * Dpad;
+        for (int r = 0; r < Sq; ++r)
+            for (int d = 0; d < kD; ++d)
+                bufs.h_Q[base + (size_t)r * Dpad + d] = bf_qpos;
+    }
+    // K := −0.5 everywhere EXCEPT row j* := +4.0.  V left random (the target).
+    for (int b = 0; b < B; ++b)
+    for (int h = 0; h < Hkv; ++h) {
+        const size_t base = ((size_t)(b * Hkv + h) * Skv) * Dpad;
+        for (int s = 0; s < Skv; ++s) {
+            const uint16_t kv = (s == jstar) ? bf_kdom : bf_kneg;
+            for (int d = 0; d < kD; ++d)
+                bufs.h_K[base + (size_t)s * Dpad + d] = kv;
+        }
+    }
+    bufs.copy_to_device();
+    FmhaFwdParams base = make_base_params(p, bufs);
+
+    // ANALYTIC TARGET (zero oracle): O[b][h][d] = the dominant key's V row,
+    // bf16-decoded.  gqa=1, Hkv==Hq ⇒ output head h reads kv-head h's V[j*].
+    std::vector<float> expected((size_t)B * Hq * kD);
+    for (int b = 0; b < B; ++b)
+    for (int h = 0; h < Hkv; ++h) {
+        const size_t vbase = ((size_t)(b * Hkv + h) * Skv + jstar) * Dpad;
+        for (int d = 0; d < kD; ++d)
+            expected[((size_t)(b * Hq + h)) * kD + d] = bf16_to_float(bufs.h_V[vbase + d]);
+    }
+
+    for (int G : {2, 4}) {
+        std::vector<float> o = run_pipe_o(/*mask=*/false, base, {G, B, Hq, Sq});
+        float max_abs = 0.0f;
+        for (int b = 0; b < B; ++b)
+        for (int h = 0; h < Hq; ++h)
+        for (int row = 0; row < Sq; ++row)
+            for (int d = 0; d < kD; ++d) {
+                const float got = o[(((size_t)(b * Hq + h) * Sq + row) * kD) + d];
+                const float exp = expected[((size_t)(b * Hq + h)) * kD + d];
+                max_abs = std::max(max_abs, std::fabs(got - exp));
+            }
+        fprintf(stderr, "[SplitAnalytic.OneDominantKey_Mask0 G=%d] max_abs=%.6g\n",
+                G, max_abs);
+        // MEASURED on gfx942: max_abs = 4.88281e-04 for BOTH G=2 and G=4 (stable
+        // and G-independent — the dominant split wins the reweight identically in
+        // either partition).  That is exactly ONE bf16 ULP at V-magnitude ~0.1
+        // (2^-11 = 4.8828e-4 — the store ULP at the largest |V| ≈ 0.1) plus the
+        // negligible ~8e-6 residual non-dominant mass.  FINAL bound = 1e-3 (~2x
+        // the observed 4.88e-4, under the 2e-3 BEST-EFFORT ceiling).  KEPT (not
+        // dropped): the measurement is stable across G and well within tolerance.
+        EXPECT_LT(max_abs, 1e-3f)
+            << "pipeline O != dominant key's V row, G=" << G;
+    }
+}
+
 int main(int argc, char** argv) {
     // Mirror the component tests' arg handling: strip any --golden* flags so the
     // gate's shared invocation (which passes them to all standalone bins) does

@@ -134,6 +134,21 @@ set_source_files_properties(
 # (No gtest_discover_tests: this repo's tests are run by path via run-gates.sh,
 #  and GoogleTest's CTest integration module is not include()d here.)
 
+# Test: split-K PRODUCER (Stage-2 RED until Task 7 lands the split globals).
+# Both oracles it uses — cpu_ref_split AND gpu_ref_split — live in src/runner/
+# (cpu_ref.cpp / gpu_ref.cpp), which IS fmha_runner, so linking fmha_runner
+# suffices: NO extra components_ref source is compiled (do not double-compile).
+# NOTE: this target is deliberately UN-LINKABLE until Task 7 defines
+# fmha_fwd_d64_bf16_msk0_split / _msk1_split.  run-gates.sh builds named targets
+# only (it does NOT build "all"), so this dangling target does not break the
+# gate.  No gtest_discover_tests (this repo runs tests by path, like test_combine).
+add_executable(test_split tests/test_split.cpp)
+target_link_libraries(test_split PRIVATE fmha_kernel fmha_runner GTest::gtest_main)
+target_link_options(test_split PRIVATE -fopenmp)
+# test_split.cpp launches a kernel and links fmha_kernel (which pulls in
+# hip::device's INTERFACE --offload-arch flag), so it must compile as HIP.
+set_source_files_properties(tests/test_split.cpp PROPERTIES LANGUAGE HIP)
+
 # Benchmark
 add_executable(bench_fmha_fwd src/bench_fmha_fwd.cpp)
 target_link_libraries(bench_fmha_fwd PRIVATE fmha_kernel fmha_runner)

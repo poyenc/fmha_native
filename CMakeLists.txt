@@ -111,6 +111,29 @@ target_link_libraries(test_epilog PRIVATE fmha_runner GTest::gtest)
 set_source_files_properties(tests/test_epilog.cpp PROPERTIES LANGUAGE HIP
     COMPILE_FLAGS "--offload-arch=${GPU_TARGET} --save-temps")
 
+# Test: split-K combine (Stage-2 RED until Task 4 lands the kernel).
+# Source A uses cpu_ref_combine (lives in components_ref, NOT in fmha_runner, so
+# it is compiled in explicitly — same pattern as test_epilog's refs).  Source B
+# uses cpu_ref_split, which IS part of fmha_runner, so no extra source for it.
+# NOTE: this target is deliberately UN-LINKABLE until Task 4 defines
+# fmha_fwd_d64_bf16_combine.  run-gates.sh builds named targets only (it does NOT
+# build "all"), so this dangling target does not break the gate.
+add_executable(test_combine tests/test_combine.cpp
+    src/components_ref/cpu_ref_combine.cpp)
+target_link_libraries(test_combine PRIVATE fmha_kernel fmha_runner GTest::gtest_main)
+target_link_options(test_combine PRIVATE -fopenmp)
+# Both sources compile as HIP: test_combine.cpp launches a kernel, and
+# cpu_ref_combine.cpp must also be HIP here because linking fmha_kernel pulls in
+# hip::device's INTERFACE --offload-arch flag, which the plain C++ compiler
+# rejects.  (test_fmha_gpu_ref compiles the same ref as C++ because it does NOT
+# link fmha_kernel.)
+set_source_files_properties(
+    tests/test_combine.cpp
+    src/components_ref/cpu_ref_combine.cpp
+    PROPERTIES LANGUAGE HIP)
+# (No gtest_discover_tests: this repo's tests are run by path via run-gates.sh,
+#  and GoogleTest's CTest integration module is not include()d here.)
+
 # Benchmark
 add_executable(bench_fmha_fwd src/bench_fmha_fwd.cpp)
 target_link_libraries(bench_fmha_fwd PRIVATE fmha_kernel fmha_runner)

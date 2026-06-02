@@ -63,6 +63,37 @@ struct FmhaFwdParams {
     const int32_t* seqstart_k;
 };
 
+// Kernarg block for the split-K *combine* pass (fmha_fwd_d64_bf16_combine).
+//
+// Split-K runs the forward attention G times over disjoint KV ranges, each pass
+// writing a *normalized* fp32 partial output + a per-row natural-log LSE into a
+// "scratch" staging buffer.  The combine pass then reweights those G partials
+// back into the single global-softmax output (see cpu_ref_combine.hpp for the
+// math) and stores the final BF16 O.  This struct is the by-value argument the
+// combine __global__ will read.
+//
+// Ownership note: this struct is OWNED HERE (added in Task 3 alongside the RED
+// test_combine).  Task 4, which implements the kernel, must NOT re-declare it.
+//
+// Scratch layout is "split-major": the G partial planes are the outermost axis,
+// so plane g for the whole (B,Hq,Sq) problem is contiguous before plane g+1.
+//   scratch_o  index of (g,b,h,row,d) =
+//       (((g*B + b)*Hq + h)*Sq + row)*64 + d        (fp32, 64 = head_dim)
+//   scratch_lse index of (g,b,h,row) =
+//       ((g*B + b)*Hq + h)*Sq + row                 (fp32)
+// (B and Hq are recovered on the device side from nhead_q + the grid; only the
+// strides the kernel actually needs to write O are passed explicitly below.)
+struct FmhaFwdCombineParams {
+    const float* scratch_o;    // [G][B][Hq][Sq][64] fp32, split-major
+    const float* scratch_lse;  // [G][B][Hq][Sq]      fp32
+    __hip_bfloat16* o;         // final output, same layout as FmhaFwdParams.o
+    float* lse;                // optional global LSE out (nullptr to skip)
+    int num_splits;            // G
+    int seqlen_q, nhead_q;
+    int stride_o, nhead_stride_o, batch_stride_o;
+    float scale;               // params.scale (base-2, log2e-folded) — for global LSE only
+};
+
 // --- Compile-time tile / launch geometry (D64 BF16 kernel specific) ---
 // These describe how the fused kernel partitions the problem and lays out LDS.
 // The benchmark also reads kM0 (M-tile size) and kBlockSize to build the grid.

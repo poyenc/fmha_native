@@ -47,7 +47,7 @@ target_compile_options(fmha_kernel PRIVATE
     "SHELL:-mllvm -amdgpu-early-inline-all=true"
     "SHELL:-mllvm -amdgpu-function-calls=false"
     "SHELL:-mllvm --lsr-drop-solution=1"
-    "SHELL:-mllvm -enable-post-misched=0"
+    "SHELL:-mllvm -enable-post-misched=1"
     -fbracket-depth=1024
     -fno-offload-uniform-block
     -fgpu-flush-denormals-to-zero)

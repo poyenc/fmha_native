@@ -271,7 +271,7 @@ __global__ void gpu_ref_split_kernel(GpuRefParams p, int kv_start, int kv_end,
 
     // ★ Per-range natural-log LSE.  local_max (== max_s) is ALREADY SCALED, so
     // there is NO extra `* scalar` here — matches gpu_ref.cpp:117 & cpu_ref_split
-    // (logf(sum)+max).  Writing `scalar*max_s` would double-apply the scale (A1).
+    // (logf(sum)+max).  Writing `scalar*max_s` would double-apply the scale.
     *lse_g = logf(sum_exp) + max_s;
 }
 

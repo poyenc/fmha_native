@@ -83,7 +83,7 @@ void cpu_ref_split(const FmhaParams& p, const FmhaBuffers& bufs,
     const int n = kv_end - kv_start;
 
     // Numerically-stable softmax over the sub-range: subtract local max.
-    // local_max is the max of the ALREADY-SCALED S (see header A1 note).
+    // local_max is the max of the ALREADY-SCALED S (see the LSE note in cpu_ref.hpp).
     float local_max = S[0];
     for (int j = 1; j < n; j++) if (S[j] > local_max) local_max = S[j];
 
@@ -122,7 +122,7 @@ void cpu_ref_split(const FmhaParams& p, const FmhaBuffers& bufs,
     }
 
     // Natural-log LSE for this range.  NO extra `* scalar` here — the scale is
-    // already baked into local_max (A1: double-applying the scale is a known
+    // already baked into local_max (double-applying the scale is a known LSE
     // bug).  Matches gpu_ref.cpp (logf(sum_exp)+max_s) and op_epilog.hpp.
     if (lse_out) *lse_out = logf(local_sum) + local_max;
 }

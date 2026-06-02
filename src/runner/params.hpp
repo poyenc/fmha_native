@@ -70,10 +70,7 @@ struct FmhaFwdParams {
 // "scratch" staging buffer.  The combine pass then reweights those G partials
 // back into the single global-softmax output (see cpu_ref_combine.hpp for the
 // math) and stores the final BF16 O.  This struct is the by-value argument the
-// combine __global__ will read.
-//
-// Ownership note: this struct is OWNED HERE (added in Task 3 alongside the RED
-// test_combine).  Task 4, which implements the kernel, must NOT re-declare it.
+// combine __global__ (fmha_fwd_d64_bf16_combine in src/fused/kernel.cpp) reads.
 //
 // Scratch layout is "split-major": the G partial planes are the outermost axis,
 // so plane g for the whole (B,Hq,Sq) problem is contiguous before plane g+1.
@@ -113,12 +110,13 @@ struct FmhaFwdCombineParams {
 // "scratch" staging buffer (same layout FmhaFwdCombineParams documents). The
 // combine pass (op_combine.hpp) then folds the G partials into the final O.
 //
-// This struct is the by-value argument the split-forward __global__ (added in
-// Task 7) receives. It simply CARRIES the existing forward kernarg (base) plus
-// the split-only extras; the device function fmha_fwd_d64_device() still takes a
-// `const FmhaFwdParams&` (== base) plus the split inputs as trailing arguments,
-// so the four existing call sites are byte-identical (they pass none of the
-// trailing args and get the defaults). See pipeline.hpp.
+// This struct is the by-value argument the split-forward __global__
+// (fmha_fwd_d64_bf16_msk{0,1}_split in kernel.cpp) receives. It simply CARRIES
+// the existing forward kernarg (base) plus the split-only extras; the device
+// function fmha_fwd_d64_device() still takes a `const FmhaFwdParams&` (== base)
+// plus the split inputs as trailing arguments, so the four existing call sites
+// are byte-identical (they pass none of the trailing args and get the defaults).
+// See pipeline.hpp.
 //
 // Scratch layout is the SAME split-major layout FmhaFwdCombineParams documents:
 //   scratch_o  (split_idx,b,h,row,d) =
@@ -133,11 +131,12 @@ struct FmhaFwdSplitParams {
     float* scratch_o;          // [G][B][Hq][Sq][64] fp32, split-major (partial O_g)
     float* scratch_lse;        // [G][B][Hq][Sq]      fp32 (natural-log LSE_g)
     int num_splits;            // G (KV axis is partitioned into G disjoint ranges)
-    // split_idx: which of the G splits this launch handles. In Task 7 the global
-    // will most likely DECODE the split index from blockIdx.z (grid z-axis is
-    // batch*num_splits), in which case this field is redundant; it is included for
-    // completeness so a host caller can also pass the split index explicitly. The
-    // device function takes split_idx as an argument either way.
+    // split_idx: which of the G splits this launch handles. The shipping globals
+    // DECODE the split index from blockIdx.z (grid z-axis is batch*num_splits;
+    // split_idx = blockIdx.z % num_splits — see kernel.cpp), so this field is
+    // redundant in the current dispatch; it is kept for completeness so a host
+    // caller could instead pass the split index explicitly. The device function
+    // takes split_idx as an argument either way.
     int split_idx;
 };
 

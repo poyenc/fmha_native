@@ -75,13 +75,13 @@ void gpu_ref_fmha_fwd(const GpuRefParams& p, hipStream_t stream = nullptr);
 //   - writes fp32 O_g normalized by THIS range's local_sum, and
 //   - writes the natural-log per-range LSE.
 //
-// LSE convention (★ A1 anti-bug): LSE_g = logf(local_sum) + local_max, where
+// LSE convention (★ the double-scale anti-bug): LSE_g = logf(local_sum) + local_max, where
 // local_max is the ALREADY-SCALED row max.  There is NO extra `* scalar` here —
 // the scale is baked into local_max up front (scores are scaled before the max).
 // This matches gpu_ref.cpp:117 (`logf(sum_exp)+max_s`), cpu_ref_split, and
 // op_epilog.hpp.  An empty / fully-masked range -> LSE_g = -INFINITY, O_g = 0.
 //
-// Output layout (T3/T4 must match this):
+// Output layout (the combine oracle reads this same layout):
 //   d_o_g  : fp32 [total_rows * head_dim], total_rows = batch*q_heads*seq_len,
 //            row index == the flat thread id (same [b,q_heads,seq] order as the
 //            existing kernel decodes), inner dimension head_dim in natural order.
@@ -96,7 +96,7 @@ void gpu_ref_split(const GpuRefParams& p, int kv_start, int kv_end,
 // (natural-e reweight by per-range LSE with the max-subtract stability trick;
 // a -inf range contributes 0; all-inf -> zero output).
 //
-// Layout (T3/T4 must match this):
+// Layout (must match gpu_ref_split's output above):
 //   d_o_part : fp32 [G * rows * Dlog], SPLIT-MAJOR — plane g (offset
 //              g*rows*Dlog) is the o_part produced by gpu_ref_split for range g.
 //              Row r of plane g is at d_o_part[(g*rows + r)*Dlog + d].

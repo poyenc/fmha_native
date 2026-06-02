@@ -538,6 +538,93 @@ TEST(SplitProducer, OneRangeRaggedG_Mask0) {
 }
 
 // ===========================================================================
+// CASE 1-GQA — One-range PRODUCER correctness UNDER GROUPED-QUERY ATTENTION
+// (gqa>1, mask0).  S=2048, q_heads=8, kv_heads=2, gqa=4 (4 Q heads share each
+// KV head).  This is the FIRST test of the split producer's GQA KV-head mapping
+// (the single-pass kernel has a passing GQA fused test, but the SPLIT path's
+// derivation kv_head = head/(nhead_q/nhead_k) was previously UNTESTED).
+//
+// HOW GQA IS EXPRESSED: make_base_params sets kp.nhead_q=8, kp.nhead_k=2 and
+// GQA-correct strides (nhead_stride_k uses kv_seq_len, batch_stride_k uses
+// kv_heads); the kernel derives the KV head per Q head internally.  The host
+// oracle cpu_ref_split(p,bufs,b,hq,...) is ALSO GQA-aware: it maps hkv=hq/gqa
+// internally, so we pass the Q head h directly and it reads the correct shared
+// KV head.  fill_random fills K/V with only Hkv=2 heads, matching both.
+//
+// For each G in {2,3,8} (clean + ragged) and every (g, q-head h∈[0,8), row) we
+// compare the producer's scratch partial to cpu_ref_split over the EXACT KV
+// sub-range the kernel walks.  If the producer's KV-head mapping were wrong
+// (e.g. it used the Q head as the KV head, or grouped the wrong way), the
+// partials would attend to a DIFFERENT KV head than the oracle and blow past
+// the 2e-3 bound — i.e. this directly pins the GQA mapping.
+// ===========================================================================
+TEST(SplitProducerGqa, OneRange_Mask0) {
+    FmhaParams p{};
+    p.batch = 1; p.q_heads = 8; p.kv_heads = 2; p.gqa = 4;   // 4 Q heads / KV head
+    p.seq_len = 2048; p.kv_seq_len = 2048; p.head_dim = kD; p.mask = 0;
+
+    const int B = p.batch, Hq = p.q_heads, Sq = p.seq_len, Skv = p.kv_seq_len;
+
+    FmhaBuffers bufs(p);
+    bufs.fill_random(42);
+    bufs.copy_to_device();   // cpu_ref_split reads host Q/K/V; kernel reads device
+    FmhaFwdParams base = make_base_params(p, bufs);
+
+    for (int G : {2, 3, 8}) {
+        std::vector<float> sco, sclse;
+        run_split(/*mask=*/false, base, {G, B, Hq, Sq}, &sco, &sclse);
+
+        float max_abs_o = 0.0f, max_abs_lse = 0.0f;
+        int mism = 0, shown = 0;
+        std::vector<float> ref_o(kD);
+        for (int g = 0; g < G; ++g)
+        for (int h = 0; h < Hq; ++h)                          // all 8 Q heads
+        for (int row = 0; row < Sq; ++row) {
+            int kv0, kv1;
+            int m_tile = row / kM0;                           // absolute M-tile
+            split_kv_range(g, G, m_tile, Sq, Skv, /*mask=*/false, &kv0, &kv1);
+
+            // cpu_ref_split maps hkv = h/gqa internally — pass the Q head h.
+            float ref_lse = -INFINITY;
+            cpu_ref_split(p, bufs, 0, h, row, kv0, kv1, ref_o.data(), &ref_lse);
+
+            float got_lse = sclse[scratch_lse_idx(g, 0, h, row, B, Hq, Sq)];
+
+            // Empty range: both sides must be the -inf sentinel; O all-zero.
+            bool ref_inf = std::isinf(ref_lse) && ref_lse < 0;
+            bool got_inf = std::isinf(got_lse) && got_lse < 0;
+            EXPECT_EQ(ref_inf, got_inf)
+                << "GQA G=" << G << " g=" << g << " h=" << h << " row=" << row
+                << " ref_lse=" << ref_lse << " got_lse=" << got_lse;
+            if (ref_inf) {
+                for (int d = 0; d < kD; ++d) {
+                    float v = sco[scratch_o_idx(g, 0, h, row, d, B, Hq, Sq)];
+                    max_abs_o = std::max(max_abs_o, std::fabs(v));   // must be 0
+                }
+                continue;
+            }
+            max_abs_lse = std::max(max_abs_lse, std::fabs(got_lse - ref_lse));
+            for (int d = 0; d < kD; ++d) {
+                float v = sco[scratch_o_idx(g, 0, h, row, d, B, Hq, Sq)];
+                float ae = std::fabs(v - ref_o[d]);
+                max_abs_o = std::max(max_abs_o, ae);
+                if (ae > 2e-3f && shown < 10) {
+                    fprintf(stderr, "  [GQA G=%d g=%d h=%d row=%d d=%d] got=%.6f ref=%.6f\n",
+                            G, g, h, row, d, v, ref_o[d]);
+                    ++shown; ++mism;
+                }
+            }
+        }
+        fprintf(stderr, "[SplitProducerGqa.OneRange_Mask0 G=%d] max_abs_o=%.6g max_abs_lse=%.6g\n",
+                G, max_abs_o, max_abs_lse);
+        // Same bf16-P-truncation noise floor as the non-GQA producer sweep
+        // (OneRangeRaggedG_Mask0): a correct GQA mapping sits far under 2e-3.
+        EXPECT_LT(max_abs_o,   2e-3f) << "GQA O_g vs cpu_ref_split, G=" << G;
+        EXPECT_LT(max_abs_lse, 2e-3f) << "GQA LSE_g vs cpu_ref_split, G=" << G;
+    }
+}
+
+// ===========================================================================
 // CASE 2 — G=1 fp32 identity (mask0).  S=2048, G=1: the single split walks the
 // WHOLE KV range, so scratch_o[0] must equal the full-range fp32 partial.  Both
 // the kernel and the oracle are fp32 with identical bf16-truncation, so the only
@@ -1130,6 +1217,184 @@ TEST(SplitCombineE2E, MatchesSinglePass) {
 }
 
 // ===========================================================================
+// END-TO-END (GQA) — split+combine pipeline O  vs  SINGLE-PASS kernel O, gqa>1.
+//
+// MatchesSinglePass (above) only ever runs gqa=1 (q_heads==kv_heads==2).  This
+// case drives the WHOLE split→combine pipeline at gqa>1 (q_heads=8, kv_heads=2,
+// gqa=4) and compares to the CK-anchored single-pass production kernel — the
+// strongest available O reference (gated bit-exact vs the CK golden dumps by the
+// 67-test fused suite).  It validates GQA wiring through every stage: the split
+// producer's KV-head derivation, the scratch sizing/indexing at Hq=8 (combine
+// grid is (Hq, m_tiles, B)), and the combine's per-head reweight.
+//
+// Covers BOTH masks at gqa>1, a clean and a ragged G, and B=1/B=2:
+//   {mask0,B1,G4,S1920}, {mask0,B2,G3,S2000}, {mask1,B1,G4,S1920}.
+// Same two scale-aware gates as MatchesSinglePass (cos ≥ 0.99995 AND
+// rel_l2 ≤ 2e-2); a correct pipeline sits at the bf16 noise floor far inside.
+// ===========================================================================
+namespace {
+struct E2EGqaCase { int mask; int B; int G; int S; int Hq; int Hkv; };
+const std::vector<E2EGqaCase> kE2EGqaCases = {
+    {0, 1, 4, 1920, 8, 2},   // mask0, clean G, B=1
+    {0, 2, 3, 2000, 8, 2},   // mask0, ragged G, B=2 (batch*G z-decode + per-batch O)
+    {1, 1, 4, 1920, 8, 2},   // mask1 (causal sentinel path) at gqa>1
+};
+}  // namespace
+
+TEST(SplitCombineE2EGqa, MatchesSinglePass_Gqa) {
+    constexpr double kCosTol   = 0.99995;  // directional / structural
+    constexpr double kRelL2Tol = 2e-2;     // magnitude (2% rel L2)
+
+    for (const E2EGqaCase& c : kE2EGqaCases) {
+        const bool mask = (c.mask != 0);
+        FmhaParams p{};
+        // GQA expressed explicitly: q_heads>kv_heads, gqa=q_heads/kv_heads.
+        p.batch = c.B; p.q_heads = c.Hq; p.kv_heads = c.Hkv; p.gqa = c.Hq / c.Hkv;
+        p.seq_len = c.S; p.kv_seq_len = c.S; p.head_dim = kD; p.mask = c.mask;
+
+        const int B = p.batch, Hq = p.q_heads, Sq = p.seq_len;
+        SCOPED_TRACE(testing::Message() << "GQA mask=" << c.mask << " B=" << B
+                                        << " G=" << c.G << " S=" << Sq
+                                        << " Hq=" << Hq << " Hkv=" << c.Hkv);
+
+        FmhaBuffers bufs(p);
+        bufs.fill_random(1234 + c.mask * 100 + c.B * 10 + c.G);
+        bufs.copy_to_device();
+        FmhaFwdParams base = make_base_params(p, bufs);
+
+        // --- Pipeline: real split → real combine through shared device scratch.
+        // run_split_keep_scratch / run_combine_e2e size scratch by dim.Hq = Hq (8
+        // here), and the combine reads nhead_q = Hq — GQA-correct.
+        float *d_sco = nullptr, *d_sclse = nullptr;
+        run_split_keep_scratch(mask, base, {c.G, B, Hq, Sq}, &d_sco, &d_sclse);
+
+        const size_t n_o = (size_t)B * Hq * Sq * kD;
+        __hip_bfloat16* d_o_pipe = nullptr;
+        ASSERT_EQ(hipMalloc(&d_o_pipe, n_o * sizeof(__hip_bfloat16)), hipSuccess);
+        ASSERT_EQ(hipMemset(d_o_pipe, 0, n_o * sizeof(__hip_bfloat16)), hipSuccess);
+        run_combine_e2e({c.G, B, Hq, Sq}, base.scale, d_sco, d_sclse, d_o_pipe);
+        hipFree(d_sco); hipFree(d_sclse);
+
+        // --- Reference: single-pass production kernel from the SAME Q/K/V.
+        __hip_bfloat16* d_o_single = nullptr;
+        ASSERT_EQ(hipMalloc(&d_o_single, n_o * sizeof(__hip_bfloat16)), hipSuccess);
+        ASSERT_EQ(hipMemset(d_o_single, 0, n_o * sizeof(__hip_bfloat16)), hipSuccess);
+        run_single_pass(mask, base, {c.G, B, Hq, Sq}, d_o_single);
+
+        std::vector<uint16_t> h_pipe(n_o), h_single(n_o);
+        ASSERT_EQ(hipMemcpy(h_pipe.data(),   d_o_pipe,   n_o * sizeof(uint16_t),
+                            hipMemcpyDeviceToHost), hipSuccess);
+        ASSERT_EQ(hipMemcpy(h_single.data(), d_o_single, n_o * sizeof(uint16_t),
+                            hipMemcpyDeviceToHost), hipSuccess);
+        hipFree(d_o_pipe); hipFree(d_o_single);
+
+        double max_abs = 0.0, dot = 0.0, na = 0.0, nb = 0.0, sse = 0.0;
+        for (size_t i = 0; i < n_o; ++i) {
+            const double a = bf16_to_float(h_pipe[i]);
+            const double b = bf16_to_float(h_single[i]);
+            const double diff = a - b;
+            if (std::fabs(diff) > max_abs) max_abs = std::fabs(diff);
+            sse += diff * diff;
+            dot += a * b; na += a * a; nb += b * b;
+        }
+        const double denom   = std::sqrt(na) * std::sqrt(nb);
+        const double cos     = denom > 0.0 ? dot / denom : 1.0;
+        const double refnorm = std::sqrt(nb);
+        const double rel_l2  = refnorm > 0.0 ? std::sqrt(sse) / refnorm : INFINITY;
+
+        fprintf(stderr,
+                "[E2E-gqa mask=%d B=%d G=%d S=%d Hq=%d Hkv=%d] max_abs=%.6g cos=%.8f rel_l2=%.6g\n",
+                c.mask, B, c.G, Sq, Hq, c.Hkv, max_abs, cos, rel_l2);
+        EXPECT_GE(cos,    kCosTol)   << "GQA cosine below gate (structural/wiring bug?)";
+        EXPECT_LE(rel_l2, kRelL2Tol) << "GQA relative L2 above gate (magnitude/wiring bug?)";
+    }
+}
+
+// ===========================================================================
+// END-TO-END (LARGE S) — split+combine pipeline O  vs  SINGLE-PASS kernel O at
+// the CUSTOMER shape S≈40000.  MatchesSinglePass only runs small S (≤2000), so
+// the combine's large-S O-index math (R, o_row_base with int/long mixing) at the
+// actual target shape was NEVER exercised end-to-end (CASE 6 covers the PRODUCER
+// scratch offsets at large S, but not the producer→combine handoff).  This is a
+// SINGLE case at the customer shape B=1, q_heads=kv_heads=2 (gqa=1), S=40000,
+// G=8, mask0 — plus one mask1 to cover the causal path at large S.
+//
+// Memory: one G*B*Hq*Sq*64 fp32 scratch at G=8,S40000,B1,H2 ≈ 164 MB + two bf16
+// O buffers — fine on MI300X.  Everything is freed each iteration.
+// Same two scale-aware gates as MatchesSinglePass (cos ≥ 0.99995, rel_l2 ≤ 2e-2).
+// ===========================================================================
+TEST(SplitCombineE2E, MatchesSinglePass_LargeS) {
+    constexpr double kCosTol   = 0.99995;
+    constexpr double kRelL2Tol = 2e-2;
+
+    struct LS { int mask; int G; int S; };
+    const std::vector<LS> cases = {
+        {0, 8, 40000},   // customer shape, mask0
+        {1, 8, 40000},   // customer shape, causal
+    };
+
+    for (const LS& c : cases) {
+        const bool mask = (c.mask != 0);
+        FmhaParams p{};
+        p.batch = 1; p.q_heads = 2; p.kv_heads = 2; p.gqa = 1;
+        p.seq_len = c.S; p.kv_seq_len = c.S; p.head_dim = kD; p.mask = c.mask;
+
+        const int B = p.batch, Hq = p.q_heads, Sq = p.seq_len;
+        SCOPED_TRACE(testing::Message() << "LargeS mask=" << c.mask
+                                        << " G=" << c.G << " S=" << Sq);
+
+        FmhaBuffers bufs(p);
+        bufs.fill_random(555 + c.mask);
+        bufs.copy_to_device();
+        FmhaFwdParams base = make_base_params(p, bufs);
+
+        // --- Pipeline: real split → real combine through shared device scratch.
+        float *d_sco = nullptr, *d_sclse = nullptr;
+        run_split_keep_scratch(mask, base, {c.G, B, Hq, Sq}, &d_sco, &d_sclse);
+
+        const size_t n_o = (size_t)B * Hq * Sq * kD;
+        __hip_bfloat16* d_o_pipe = nullptr;
+        ASSERT_EQ(hipMalloc(&d_o_pipe, n_o * sizeof(__hip_bfloat16)), hipSuccess);
+        ASSERT_EQ(hipMemset(d_o_pipe, 0, n_o * sizeof(__hip_bfloat16)), hipSuccess);
+        run_combine_e2e({c.G, B, Hq, Sq}, base.scale, d_sco, d_sclse, d_o_pipe);
+        hipFree(d_sco); hipFree(d_sclse);
+
+        // --- Reference: single-pass production kernel from the SAME Q/K/V.
+        __hip_bfloat16* d_o_single = nullptr;
+        ASSERT_EQ(hipMalloc(&d_o_single, n_o * sizeof(__hip_bfloat16)), hipSuccess);
+        ASSERT_EQ(hipMemset(d_o_single, 0, n_o * sizeof(__hip_bfloat16)), hipSuccess);
+        run_single_pass(mask, base, {c.G, B, Hq, Sq}, d_o_single);
+
+        std::vector<uint16_t> h_pipe(n_o), h_single(n_o);
+        ASSERT_EQ(hipMemcpy(h_pipe.data(),   d_o_pipe,   n_o * sizeof(uint16_t),
+                            hipMemcpyDeviceToHost), hipSuccess);
+        ASSERT_EQ(hipMemcpy(h_single.data(), d_o_single, n_o * sizeof(uint16_t),
+                            hipMemcpyDeviceToHost), hipSuccess);
+        hipFree(d_o_pipe); hipFree(d_o_single);
+
+        double max_abs = 0.0, dot = 0.0, na = 0.0, nb = 0.0, sse = 0.0;
+        for (size_t i = 0; i < n_o; ++i) {
+            const double a = bf16_to_float(h_pipe[i]);
+            const double b = bf16_to_float(h_single[i]);
+            const double diff = a - b;
+            if (std::fabs(diff) > max_abs) max_abs = std::fabs(diff);
+            sse += diff * diff;
+            dot += a * b; na += a * a; nb += b * b;
+        }
+        const double denom   = std::sqrt(na) * std::sqrt(nb);
+        const double cos     = denom > 0.0 ? dot / denom : 1.0;
+        const double refnorm = std::sqrt(nb);
+        const double rel_l2  = refnorm > 0.0 ? std::sqrt(sse) / refnorm : INFINITY;
+
+        fprintf(stderr,
+                "[E2E-largeS mask=%d G=%d S=%d] max_abs=%.6g cos=%.8f rel_l2=%.6g\n",
+                c.mask, c.G, Sq, max_abs, cos, rel_l2);
+        EXPECT_GE(cos,    kCosTol)   << "LargeS cosine below gate (structural/wiring bug?)";
+        EXPECT_LE(rel_l2, kRelL2Tol) << "LargeS relative L2 above gate (magnitude/wiring bug?)";
+    }
+}
+
+// ===========================================================================
 // ORACLE-FREE INVARIANT #2a — G-to-G direct equality (mask0).
 //
 // WHY THIS IS DIFFERENT FROM EVERYTHING ABOVE: every prior test compares the
@@ -1167,8 +1432,12 @@ TEST(SplitInvariant, GtoGDirectEquality_Mask0) {
     // Amplify Q so the softmax is genuinely peaked (see amplify_q): without this
     // the near-uniform softmax makes O≈mean(V) and the invariant is trivially
     // satisfied — a vacuous test.  G-invariance must hold for ANY input, so a
-    // non-uniform input is the stronger witness.
-    amplify_q(bufs.h_Q, B * Hq * Sq, 16.0f);
+    // non-uniform input is the stronger witness.  We use 64x (raised from 16x): a
+    // verifier sweep showed the catastrophic CAN-FAIL margin (permute K not V)
+    // grows ~linearly with the factor (8x→2.3e-4, 16x→4.6e-4, 32x→9.1e-4) while
+    // the CLEAN G-to-G delta stays pinned at 1 bf16 ULP (3.05e-5), so 64x makes
+    // the test maximally discriminating without moving the clean floor.
+    amplify_q(bufs.h_Q, B * Hq * Sq, 64.0f);
     bufs.copy_to_device();
     FmhaFwdParams base = make_base_params(p, bufs);
 
@@ -1190,13 +1459,79 @@ TEST(SplitInvariant, GtoGDirectEquality_Mask0) {
             d42, d82);
 
     // TOLERANCE (measured, then 2x headroom — mirrors CASE 2's discipline).
-    // Observed on gfx942: max_abs(o4-o2)=3.05176e-05, max_abs(o8-o2)=3.05176e-05
-    // — exactly ONE bf16 ULP at O-magnitude ~0.02 (2^-8 · 2^-3 ≈ 3.1e-5).  Final
-    // bound = 6.5e-5 (~2x the observed value).  A real combine/producer math bug
-    // (e.g. a mis-scaled reweight) would break G-invariance and overshoot this by
-    // orders of magnitude.
+    // Observed on gfx942 at the 64x amplify: max_abs(o4-o2)=3.05176e-05,
+    // max_abs(o8-o2)=3.05176e-05 — STILL exactly ONE bf16 ULP at O-magnitude ~0.02
+    // (2^-8 · 2^-3 ≈ 3.1e-5), i.e. raising 16x→64x did NOT move the clean floor.
+    // Final bound = 6.5e-5 (~2x the observed value).  A real combine/producer math
+    // bug (e.g. a mis-scaled reweight) would break G-invariance and overshoot this
+    // by orders of magnitude.
     EXPECT_LT(d42, 6.5e-5f) << "G=4 vs G=2 O disagreement (G-invariance broken)";
     EXPECT_LT(d82, 6.5e-5f) << "G=8 vs G=2 O disagreement (G-invariance broken)";
+}
+
+// ===========================================================================
+// ORACLE-FREE INVARIANT #2a' — G-to-G direct equality (mask1, CAUSAL).
+//
+// The SAME oracle-free G-invariance idea as GtoGDirectEquality_Mask0, but with
+// the causal mask on.  Before this case the strong oracle-free classes were
+// mask0-ONLY; this is a FREE causal witness that costs no new oracle.
+//
+// WHY G-INVARIANCE STILL HOLDS UNDER CAUSAL: split-K partitions each M-tile's
+// CAUSAL-CLAMPED KV range (causal_kv_end) into G disjoint sub-ranges.  A masked-
+// future split contributes the -inf/0 sentinel (weight 0 in the combine), and
+// the surviving splits' partials are reweighted by the standard flash-decoding
+// convex w_g = exp(LSE_g − LSE*) / Σ exp(LSE_h − LSE*).  That reconstruction
+// recovers the SAME causal global softmax over [0, causal_kv_end) regardless of
+// where the partition boundaries fall — so O(G=2), O(G=4), O(G=8) are the SAME
+// number in exact arithmetic.  Causal changes WHICH keys each row sees and the
+// per-tile work, but NOT the G-independence of the reconstructed result.
+//
+// Same 64x amplify as the mask0 sibling (peaks the softmax so the property is
+// non-vacuous).  Tolerance measured below; bound = ~2x measured.
+// ===========================================================================
+TEST(SplitInvariant, GtoGDirectEquality_Mask1) {
+    FmhaParams p{};
+    p.batch = 1; p.q_heads = 2; p.kv_heads = 2; p.gqa = 1;
+    p.seq_len = 1920; p.kv_seq_len = 1920; p.head_dim = kD; p.mask = 1;
+
+    const int B = p.batch, Hq = p.q_heads, Sq = p.seq_len;
+
+    FmhaBuffers bufs(p);
+    bufs.fill_random(20260602);
+    // Peak the softmax (see amplify_q + the mask0 sibling's note); 64x.
+    amplify_q(bufs.h_Q, B * Hq * Sq, 64.0f);
+    bufs.copy_to_device();
+    FmhaFwdParams base = make_base_params(p, bufs);
+
+    // Same producer + same combine, only G differs, mask=1 (causal).  o2 is the
+    // shared baseline; o4 and o8 must each reproduce it (each other's oracle).
+    std::vector<float> o2 = run_pipe_o(/*mask=*/true, base, {2, B, Hq, Sq});
+    std::vector<float> o4 = run_pipe_o(/*mask=*/true, base, {4, B, Hq, Sq});
+    std::vector<float> o8 = run_pipe_o(/*mask=*/true, base, {8, B, Hq, Sq});
+
+    auto max_abs = [](const std::vector<float>& a, const std::vector<float>& b) {
+        float m = 0.0f;
+        for (size_t i = 0; i < a.size(); ++i)
+            m = std::max(m, std::fabs(a[i] - b[i]));
+        return m;
+    };
+    const float d42 = max_abs(o4, o2);
+    const float d82 = max_abs(o8, o2);
+    fprintf(stderr, "[SplitInvariant.GtoG_Mask1] max_abs(o4-o2)=%.6g max_abs(o8-o2)=%.6g\n",
+            d42, d82);
+
+    // TOLERANCE (measured, then ~2x headroom).  Observed on gfx942 at the 64x
+    // amplify: max_abs(o4-o2)=6.10352e-05, max_abs(o8-o2)=6.10352e-05 — exactly
+    // TWO bf16 ULP at O-magnitude ~0.02 (one ULP MORE than the mask0 sibling's
+    // 3.05e-5).  The extra ULP is expected: causal partitions each M-tile's
+    // causal-clamped range differently per G (ragged last tiles + masked-future
+    // sentinels move per partition), so the fp32-accumulation/reweight rounding
+    // spread is one ULP wider — still G-invariant, just at 2 ULP not 1.  Final
+    // bound = 1.3e-4 (~2x the observed 6.10e-5).  A causal-path math bug (e.g. a
+    // split that reaches a masked-future key, or a mis-reweighted sentinel) breaks
+    // G-invariance and overshoots this by orders of magnitude.
+    EXPECT_LT(d42, 1.3e-4f) << "mask1 G=4 vs G=2 O disagreement (G-invariance broken)";
+    EXPECT_LT(d82, 1.3e-4f) << "mask1 G=8 vs G=2 O disagreement (G-invariance broken)";
 }
 
 // ===========================================================================
@@ -1242,7 +1577,11 @@ TEST(SplitInvariant, KvPermutationInvariance_Mask0) {
     // IDENTICALLY in A and B (same seed → same Q → same scaled Q).
     FmhaBuffers bufsA(p);
     bufsA.fill_random(7777);
-    amplify_q(bufsA.h_Q, B * Hq * Sq, 16.0f);
+    // 64x (raised from 16x): peaks the softmax harder so KV-order invariance is a
+    // genuinely falsifiable property.  A verifier sweep showed the catastrophic
+    // CAN-FAIL margin (permute K not V) grows ~linearly with the factor while the
+    // CLEAN delta stays pinned at 1 bf16 ULP (3.05e-5) — see the tolerance note.
+    amplify_q(bufsA.h_Q, B * Hq * Sq, 64.0f);
     bufsA.copy_to_device();
     FmhaFwdParams baseA = make_base_params(p, bufsA);
     std::vector<float> oA = run_pipe_o(false, baseA, {G, B, Hq, Sq});
@@ -1264,7 +1603,7 @@ TEST(SplitInvariant, KvPermutationInvariance_Mask0) {
     // dst row s ← source row perm[s].
     FmhaBuffers bufsB(p);
     bufsB.fill_random(7777);
-    amplify_q(bufsB.h_Q, B * Hq * Sq, 16.0f);  // identical Q to buffer A
+    amplify_q(bufsB.h_Q, B * Hq * Sq, 64.0f);  // identical 64x Q to buffer A
     auto K0 = bufsB.h_K;        // pre-permute copies (the read source)
     auto V0 = bufsB.h_V;
     for (int b = 0; b < B; ++b)
@@ -1288,13 +1627,14 @@ TEST(SplitInvariant, KvPermutationInvariance_Mask0) {
         m = std::max(m, std::fabs(oA[i] - oB[i]));
     fprintf(stderr, "[SplitInvariant.KvPerm_Mask0] max_abs(oA-oB)=%.6g\n", m);
 
-    // TOLERANCE (measured, then 2x headroom).  Observed on gfx942:
-    // max_abs(oA-oB)=3.05176e-05 — one bf16 ULP at O-magnitude ~0.02.  The
-    // permutation changes BOTH the online-softmax accumulation order AND the
-    // absolute-key→split assignment (keys cross kN0=64 tile/split boundaries), but
-    // at this seed the net movement is still a single ULP.  Final bound = 6.5e-5
-    // (~2x observed).  Permuting K without V (the can-fail) attaches weights to
-    // the wrong V rows and blows far past this.
+    // TOLERANCE (measured, then 2x headroom).  Observed on gfx942 at the 64x
+    // amplify: max_abs(oA-oB)=3.05176e-05 — STILL one bf16 ULP at O-magnitude
+    // ~0.02 (raising 16x→64x did NOT move the clean floor).  The permutation
+    // changes BOTH the online-softmax accumulation order AND the absolute-key→split
+    // assignment (keys cross kN0=64 tile/split boundaries), but at this seed the
+    // net movement is still a single ULP.  Final bound = 6.5e-5 (~2x observed).
+    // Permuting K without V (the can-fail) attaches weights to the wrong V rows
+    // and blows far past this.
     EXPECT_LT(m, 6.5e-5f) << "O changed under KV permutation (order-invariance broken)";
 }
 

@@ -90,17 +90,34 @@ constexpr int LdsSeq[4] = {1, 2, 1, 0};
 // One block's full FMHA forward pass over its M-tile.
 //   HasMask  : compile-time. false = boundary mask only; true = causal+boundary.
 //   IsVarlen : compile-time. false = dense batch tensors; true = group/varlen.
+//   IsSplit  : compile-time. false (DEFAULT) = the ordinary forward pass used by
+//              the four existing entries — every split-specific branch below is
+//              `if constexpr`-discarded, so codegen for those entries is byte-for-
+//              byte unchanged. true = split-K: walk only this split's disjoint KV
+//              sub-range and write a normalized fp32 partial (O_g, LSE_g) to the
+//              split-major scratch via epilog_store_split (see op_epilog.hpp).
 //   params   : tensor pointers, strides, scale, optional LSE/seqstart arrays.
 //   lds      : this block's __shared__ scratch (kLdsBytes; the 3 rotating buffers).
 //   batch_idx/head_idx/m_tile_idx : the tile coordinates (from blockIdx; the
 //                                   causal M-tile reversal already applied in
 //                                   kernel.cpp for the masked entries).
-template <bool HasMask, bool IsVarlen>
+//   --- TRAILING split-only args (defaults keep the four existing call sites
+//       byte-identical: they pass none of these, so non-split callers are
+//       unchanged) ---
+//   scratch_o   : split-major fp32 partial-O scratch base (IsSplit only).
+//   scratch_lse : split-major fp32 LSE scratch base (IsSplit only).
+//   num_splits  : G — the KV axis is partitioned into G disjoint ranges.
+//   split_idx   : which of the G splits this block handles (0..G-1).
+template <bool HasMask, bool IsVarlen, bool IsSplit = false>
 __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
                                     char* lds,
                                     int batch_idx,
                                     int head_idx,
-                                    int m_tile_idx) {
+                                    int m_tile_idx,
+                                    float* scratch_o = nullptr,
+                                    float* scratch_lse = nullptr,
+                                    int num_splits = 1,
+                                    int split_idx = 0) {
     // ---- Thread geometry (TransposedC; see file header / op_gemm.hpp) ----
     const int lane_id = threadIdx.x & 63;
     const int warp_id = threadIdx.x >> 6;
@@ -195,29 +212,90 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     // Number of kN0(=64)-key tiles this block walks.
     int num_total_loop = (seqlen_k_end - seqlen_k_start + kN0 - 1) / kN0;
 
+    // ---- SPLIT-K KV-range narrowing (IsSplit=true ONLY) ----
+    // Discarded entirely when IsSplit=false (the four existing entries), so their
+    // loop-bound codegen is unchanged. For a split, partition the FULL tile count
+    // computed above into G contiguous chunks and keep only THIS split's chunk:
+    //   T (tiles per split) = ceil(num_total_loop_full / num_splits)
+    //   this split owns tiles [split_idx*T, min((split_idx+1)*T, full))
+    // Translating tiles -> keys (×kN0) and adding to the existing seqlen_k_start
+    // narrows WITHIN the already-causal-clamped [seqlen_k_start, seqlen_k_end)
+    // range, so masked-future tiles a causal M-tile already excluded stay excluded
+    // (A4 causal-correctness). The kv_offset / kv_v_byte / kv_k_byte induction
+    // vars below initialize from seqlen_k_start, so narrowing it here makes them
+    // pick up the split's start key automatically (no separate fix-up needed).
+    // An empty split (start tile >= full) leaves num_total_loop <= 0, so the
+    // degenerate sentinel path below fires (and, for IsSplit, writes the fp32
+    // -inf/0 sentinel plane via epilog_store_split — see that path).
+    if constexpr (IsSplit) {
+        int num_total_loop_full = num_total_loop;
+        int tiles_per_split = (num_total_loop_full + num_splits - 1) / num_splits;
+        int tile_lo = split_idx * tiles_per_split;
+        int tile_hi = tile_lo + tiles_per_split;
+        if (tile_hi > num_total_loop_full) tile_hi = num_total_loop_full;
+        // Narrow within the existing (possibly causal-clamped) range.
+        int base_start = seqlen_k_start;
+        seqlen_k_start = base_start + tile_lo * kN0;
+        seqlen_k_end   = base_start + tile_hi * kN0;
+        if (seqlen_k_end > seqlen_k) seqlen_k_end = seqlen_k;
+        if (seqlen_k_start > seqlen_k_end) seqlen_k_start = seqlen_k_end; // empty split
+        num_total_loop = (seqlen_k_end - seqlen_k_start + kN0 - 1) / kN0;
+    }
+
     // O accumulator (numerator of online softmax): two kHeadDim/2 halves in the
     // TransposedC layout, carried across all KV tiles. Start at zero.
     v16f o_acc_d0, o_acc_d1;
     clear_acc(o_acc_d0);
     clear_acc(o_acc_d1);
 
+    // ---- SPLIT-K scratch row-plane base pointers (IsSplit=true ONLY) ----
+    // Resolve, for THIS (split_idx, b, h), the base of the Sq×64 fp32 partial-O
+    // plane and the Sq fp32 LSE plane in the split-major scratch buffer:
+    //   scratch_o_base  = scratch_o  + (((split_idx*B + b)*Hq + h)*Sq)*64
+    //   scratch_lse_base= scratch_lse + (((split_idx*B + b)*Hq + h)*Sq)
+    // epilog_store_split then just adds the in-plane row/col (abs_m_row*64 + col /
+    // abs_m_row). Hq == params.nhead_q. B is not a kernarg field: the split grid's
+    // z-axis is batch*num_splits, so B = gridDim.z / num_splits (documented in
+    // FmhaFwdSplitParams). The whole block is if-constexpr-discarded for the four
+    // existing (non-split) entries, so it never touches their codegen.
+    float* scratch_o_base   = nullptr;
+    float* scratch_lse_base = nullptr;
+    if constexpr (IsSplit) {
+        const int Hq = params.nhead_q;
+        const int Sq = params.seqlen_q;
+        const int B  = gridDim.z / num_splits;
+        const int64_t plane = (((static_cast<int64_t>(split_idx) * B + batch_idx)
+                                 * Hq + head_idx) * Sq);
+        scratch_o_base   = scratch_o   + plane * kHeadDim;
+        scratch_lse_base = scratch_lse + plane;
+    }
+
     // Degenerate tile (e.g. a causal M-tile whose every key is masked, or a varlen
     // tail): no KV work. Emit a zeroed O row with LSE=-inf and return. The LSE base
     // resolution mirrors the epilogue's (kept inline to avoid carrying it down).
+    // For a split this is ALSO the empty-split path (narrowed range empty); it must
+    // write the fp32 -inf/0 sentinel plane via epilog_store_split (A4: a mask1
+    // split entirely in the masked-future region still owns its scratch plane), NOT
+    // the bf16 epilog_store. The else-branch is the EXISTING code, unchanged.
     if (num_total_loop <= 0) {
-        float* lse_base = nullptr;
-        if (params.lse) {
-            if constexpr (IsVarlen) {
-                int nhead_stride_lse = params.nhead_stride_q / params.stride_q;
-                lse_base = params.lse + static_cast<int64_t>(head_idx) * nhead_stride_lse + offset_q;
-            } else {
-                lse_base = params.lse
-                    + static_cast<int64_t>(batch_idx) * (params.nhead_q * params.seqlen_q)
-                    + static_cast<int64_t>(head_idx) * params.seqlen_q;
+        if constexpr (IsSplit) {
+            epilog_store_split(o_acc_d0, o_acc_d1, 0.0f, -INFINITY, params.scale,
+                               seqlen_q, m_tile_idx, scratch_o_base, scratch_lse_base);
+        } else {
+            float* lse_base = nullptr;
+            if (params.lse) {
+                if constexpr (IsVarlen) {
+                    int nhead_stride_lse = params.nhead_stride_q / params.stride_q;
+                    lse_base = params.lse + static_cast<int64_t>(head_idx) * nhead_stride_lse + offset_q;
+                } else {
+                    lse_base = params.lse
+                        + static_cast<int64_t>(batch_idx) * (params.nhead_q * params.seqlen_q)
+                        + static_cast<int64_t>(head_idx) * params.seqlen_q;
+                }
             }
+            epilog_store(o_acc_d0, o_acc_d1, 0.0f, -INFINITY, params.scale,
+                         params.stride_o, lse_base, seqlen_q, m_tile_idx, o_base);
         }
-        epilog_store(o_acc_d0, o_acc_d1, 0.0f, -INFINITY, params.scale,
-                     params.stride_o, lse_base, seqlen_q, m_tile_idx, o_base);
         return;
     }
 
@@ -400,25 +478,35 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
 
     } while (i_total_loops < num_total_loop);
 
-    // ---- EPILOGUE: normalize O_acc by rsum, bf16-truncate, store O (+LSE) ----
-    // Resolve the LSE output base for this (batch/varlen, head). For varlen the LSE
-    // tensor is packed like Q (nhead_stride derived from Q's element strides + the
-    // sequence offset); for dense it is [batch][head][seqlen_q]. nullptr if the
-    // caller did not request LSE.
-    float* lse_base = nullptr;
-    if (params.lse) {
-        if constexpr (IsVarlen) {
-            int nhead_stride_lse = params.nhead_stride_q / params.stride_q;
-            lse_base = params.lse + static_cast<int64_t>(head_idx) * nhead_stride_lse + offset_q;
-        } else {
-            lse_base = params.lse
-                + static_cast<int64_t>(batch_idx) * (params.nhead_q * params.seqlen_q)
-                + static_cast<int64_t>(head_idx) * params.seqlen_q;
+    // ---- EPILOGUE: normalize O_acc by rsum, store O (+LSE) ----
+    // For a split (IsSplit=true) write the NORMALIZED fp32 partial (O_g, LSE_g) to
+    // this split's scratch plane via epilog_store_split; the combine pass folds the
+    // G partials later. For the four existing entries (IsSplit=false) the else-
+    // branch is the EXISTING bf16 epilogue, character-for-character, so codegen is
+    // unchanged.
+    if constexpr (IsSplit) {
+        epilog_store_split(o_acc_d0, o_acc_d1, rsum, rmax, params.scale,
+                           seqlen_q, m_tile_idx, scratch_o_base, scratch_lse_base);
+    } else {
+        // Resolve the LSE output base for this (batch/varlen, head). For varlen the
+        // LSE tensor is packed like Q (nhead_stride derived from Q's element strides
+        // + the sequence offset); for dense it is [batch][head][seqlen_q]. nullptr
+        // if the caller did not request LSE.
+        float* lse_base = nullptr;
+        if (params.lse) {
+            if constexpr (IsVarlen) {
+                int nhead_stride_lse = params.nhead_stride_q / params.stride_q;
+                lse_base = params.lse + static_cast<int64_t>(head_idx) * nhead_stride_lse + offset_q;
+            } else {
+                lse_base = params.lse
+                    + static_cast<int64_t>(batch_idx) * (params.nhead_q * params.seqlen_q)
+                    + static_cast<int64_t>(head_idx) * params.seqlen_q;
+            }
         }
-    }
 
-    // Hand the final running numerator (o_acc), denominator (rsum) and max (rmax)
-    // to the epilogue, which divides, truncates to bf16, and writes O/LSE to DRAM.
-    epilog_store(o_acc_d0, o_acc_d1, rsum, rmax, params.scale,
-                 params.stride_o, lse_base, seqlen_q, m_tile_idx, o_base);
+        // Hand the final running numerator (o_acc), denominator (rsum) and max (rmax)
+        // to the epilogue, which divides, truncates to bf16, and writes O/LSE to DRAM.
+        epilog_store(o_acc_d0, o_acc_d1, rsum, rmax, params.scale,
+                     params.stride_o, lse_base, seqlen_q, m_tile_idx, o_base);
+    }
 }

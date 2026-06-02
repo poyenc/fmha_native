@@ -94,6 +94,44 @@ struct FmhaFwdCombineParams {
     float scale;               // params.scale (base-2, log2e-folded) — for global LSE only
 };
 
+// Kernarg block for the split-K *forward* pass (the IsSplit=true variant of the
+// fused forward kernel).
+//
+// Split-K runs the SAME per-block forward pass as the four existing entries, but
+// each block walks only a disjoint sub-range of the KV axis (its "split") and,
+// instead of bf16-truncating O straight to the final tensor, writes a NORMALIZED
+// fp32 partial output O_g + a per-row natural-log LSE_g into the split-major
+// "scratch" staging buffer (same layout FmhaFwdCombineParams documents). The
+// combine pass (op_combine.hpp) then folds the G partials into the final O.
+//
+// This struct is the by-value argument the split-forward __global__ (added in
+// Task 7) receives. It simply CARRIES the existing forward kernarg (base) plus
+// the split-only extras; the device function fmha_fwd_d64_device() still takes a
+// `const FmhaFwdParams&` (== base) plus the split inputs as trailing arguments,
+// so the four existing call sites are byte-identical (they pass none of the
+// trailing args and get the defaults). See pipeline.hpp.
+//
+// Scratch layout is the SAME split-major layout FmhaFwdCombineParams documents:
+//   scratch_o  (split_idx,b,h,row,d) =
+//       (((split_idx*B + b)*Hq + h)*Sq + row)*64 + d   (fp32, 64 = head_dim)
+//   scratch_lse(split_idx,b,h,row)   =
+//        ((split_idx*B + b)*Hq + h)*Sq + row           (fp32)
+// (B and Hq are recovered device-side: Hq == base.nhead_q, and the split grid's
+// z-axis is batch*num_splits so B == gridDim.z / num_splits. See pipeline.hpp's
+// epilogue base-pointer computation.)
+struct FmhaFwdSplitParams {
+    FmhaFwdParams base;        // the ordinary forward kernarg (tensors, strides, scale)
+    float* scratch_o;          // [G][B][Hq][Sq][64] fp32, split-major (partial O_g)
+    float* scratch_lse;        // [G][B][Hq][Sq]      fp32 (natural-log LSE_g)
+    int num_splits;            // G (KV axis is partitioned into G disjoint ranges)
+    // split_idx: which of the G splits this launch handles. In Task 7 the global
+    // will most likely DECODE the split index from blockIdx.z (grid z-axis is
+    // batch*num_splits), in which case this field is redundant; it is included for
+    // completeness so a host caller can also pass the split index explicitly. The
+    // device function takes split_idx as an argument either way.
+    int split_idx;
+};
+
 // --- Compile-time tile / launch geometry (D64 BF16 kernel specific) ---
 // These describe how the fused kernel partitions the problem and lays out LDS.
 // The benchmark also reads kM0 (M-tile size) and kBlockSize to build the grid.

@@ -111,3 +111,23 @@ __global__ void __launch_bounds__(kBlockSize)
 fmha_fwd_d64_bf16_combine(FmhaFwdCombineParams params) {
     combine_split(params, blockIdx.z, blockIdx.x, blockIdx.y);
 }
+
+// ================================================================
+// G-COMPILE-SPLITSTORE: force the IsSplit=true path to typecheck (Task 5)
+// ================================================================
+//   `if constexpr (IsSplit)` discards the split body UNCOMPILED for the four
+//   existing <...,false> entries, so without an explicit IsSplit=true use the new
+//   epilog_store_split + KV-narrowing code would never be instantiated (and could
+//   silently fail to compile). This explicit instantiation forces the compiler to
+//   instantiate the IsSplit=true body and thus epilog_store_split, proving they
+//   typecheck. It is NOT a launchable __global__ — just an instantiation of the
+//   __device__ helper — so it adds no new kernel symbol and cannot collide with
+//   the real split global Task 7 will add. The negative control in Task 5 (break a
+//   line in epilog_store_split -> build fails -> revert -> clean) confirms this
+//   instantiation really compiles that code. <false,false,true> is sufficient: it
+//   exercises the same epilog_store_split + scratch-base + narrowing code the other
+//   mask/varlen combinations reuse.
+template __device__ void
+fmha_fwd_d64_device<false, false, true>(const FmhaFwdParams&, char*,
+                                        int, int, int,
+                                        float*, float*, int, int);

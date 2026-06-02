@@ -11,10 +11,125 @@
 #include <algorithm>
 #include <string>
 
+void cpu_ref_split(const FmhaParams& p, const FmhaBuffers& bufs,
+                   int b, int hq, int i, int kv_start, int kv_end,
+                   float* o_row, float* lse_out) {
+    const int Sq   = p.seq_len;
+    const int Skv  = p.kv_seq_len;
+    const int Dlog = p.head_dim;
+    const int Dpad = p.hdim_dispatch();
+    const bool varlen_mode = !p.varlen_seqs.empty();
+    const uint32_t total_sl = bufs.total_seqlen;
+    const float scalar = p.scalar();
+
+    const uint16_t* h_Q = bufs.h_Q.data();
+    const uint16_t* h_K = bufs.h_K.data();
+    const uint16_t* h_V = bufs.h_V.data();
+
+    // Per-batch (varlen) or global (dense) sequence lengths.
+    const int Sq_b  = varlen_mode ? p.varlen_seqs[b] : Sq;
+    const int Skv_b = varlen_mode ? p.varlen_seqs[b] : Skv;
+
+    // Recompute the same Q/K/V base offsets cpu_ref_verify uses for this row.
+    // (Recomputing per call is intentional — see cpu_ref.hpp / the split-K
+    // plan; the cost is negligible next to the O(Skv*Dlog) inner work.)
+    const int hkv = hq / p.gqa;
+    size_t Q_off, K_base, V_base;
+    if (varlen_mode) {
+        // Reconstruct the cumulative varlen offset for batch b.
+        uint32_t vl_off = 0;
+        for (int bb = 0; bb < b; bb++) vl_off += p.varlen_seqs[bb];
+        Q_off  = ((size_t)hq  * total_sl + vl_off + i) * Dpad;
+        K_base = ((size_t)hkv * total_sl + vl_off)     * Dpad;
+        V_base = K_base;
+    } else {
+        Q_off  = (((size_t)b * p.q_heads  + hq ) * Sq  + i) * Dpad;
+        K_base = ((size_t)b * p.kv_heads + hkv) * Skv * Dpad;
+        V_base = ((size_t)b * p.kv_heads + hkv) * Skv * Dpad;
+    }
+
+    // Clamp the requested range to this batch's valid KV span.
+    if (kv_start < 0)      kv_start = 0;
+    if (kv_end   > Skv_b)  kv_end   = Skv_b;
+
+    // Empty range: nothing to attend to -> zero output, -inf LSE.
+    if (kv_start >= kv_end) {
+        for (int d = 0; d < Dlog; d++) o_row[d] = 0.0f;
+        if (lse_out) *lse_out = -INFINITY;
+        return;
+    }
+
+    // Scores S = (Q . K^T) * scalar over the sub-range, with causal mask.
+    // scalar is the PLAIN 1/sqrt(head_dim); softmax below is natural-e (expf).
+    // The base-2 (log2(e)) trick lives only in the GPU kernel; both produce
+    // the same probabilities.
+    std::vector<float> S(kv_end - kv_start);
+    for (int j = kv_start; j < kv_end; j++) {
+        float s = 0;
+        for (int d = 0; d < Dlog; d++) {
+            float q = bf16_to_float(h_Q[Q_off + d]);
+            float k = bf16_to_float(h_K[K_base + (size_t)j * Dpad + d]);
+            s += q * k;
+        }
+        float sj = s * scalar;
+        // Right-aligned causal mask (FA-2 / CK convention): query row i may
+        // attend key j only up to i + (Skv_b - Sq_b); the (Skv_b - Sq_b) shift
+        // aligns the diagonal when k and q lengths differ.  Masked positions
+        // are set to -inf so exp() -> 0.
+        if (p.mask && j > i + (Skv_b - Sq_b)) sj = -INFINITY;
+        S[j - kv_start] = sj;
+    }
+
+    const int n = kv_end - kv_start;
+
+    // Numerically-stable softmax over the sub-range: subtract local max.
+    // local_max is the max of the ALREADY-SCALED S (see header A1 note).
+    float local_max = S[0];
+    for (int j = 1; j < n; j++) if (S[j] > local_max) local_max = S[j];
+
+    if (local_max == -INFINITY) {
+        // Entire sub-range masked out (can happen with causal masking):
+        // zero output and -inf LSE, matching the empty-range convention.
+        for (int d = 0; d < Dlog; d++) o_row[d] = 0.0f;
+        if (lse_out) *lse_out = -INFINITY;
+        return;
+    }
+
+    std::vector<float> P(n);
+    float local_sum = 0;
+    for (int j = 0; j < n; j++) {
+        P[j] = (std::isinf(S[j]) && S[j] < 0) ? 0.0f : expf(S[j] - local_max);
+        local_sum += P[j];
+    }
+    float inv_sum = 1.0f / local_sum;
+    for (int j = 0; j < n; j++) {
+        P[j] *= inv_sum;
+        // Emulate the kernel data path: P is truncated to BF16 and widened
+        // back before the P.V GEMM, so the reference sees the same rounding
+        // as the shader.
+        P[j] = bf16_to_float(float_to_bf16(P[j]));
+    }
+
+    // P.V accumulation over the sub-range -> fp32 output (normalized by THIS
+    // range's sum, since P was already divided by local_sum above).
+    for (int d = 0; d < Dlog; d++) {
+        float o = 0;
+        for (int j = kv_start; j < kv_end; j++) {
+            float v = bf16_to_float(h_V[V_base + (size_t)j * Dpad + d]);
+            o += P[j - kv_start] * v;
+        }
+        o_row[d] = o;
+    }
+
+    // Natural-log LSE for this range.  NO extra `* scalar` here — the scale is
+    // already baked into local_max (A1: double-applying the scale is a known
+    // bug).  Matches gpu_ref.cpp (logf(sum_exp)+max_s) and op_epilog.hpp.
+    if (lse_out) *lse_out = logf(local_sum) + local_max;
+}
+
 CpuRefResult cpu_ref_verify(const FmhaParams& p, const FmhaBuffers& bufs) {
     const int B    = p.batch;
     const int Hq   = p.q_heads;
-    const int Hkv  = p.kv_heads;
     const int Sq   = p.seq_len;
     const int Skv  = p.kv_seq_len;
     const int Dlog = p.head_dim;
@@ -22,7 +137,8 @@ CpuRefResult cpu_ref_verify(const FmhaParams& p, const FmhaBuffers& bufs) {
     const bool varlen_mode = !p.varlen_seqs.empty();
     const uint32_t total_sl = bufs.total_seqlen;
 
-    const float scalar  = p.scalar();
+    // Q/K/V scoring now lives in cpu_ref_split; this routine only reads the
+    // kernel output (h_O) for comparison.
     const float tol_abs = 0.001f;
     const float tol_rel = 0.05f;
     const double tol_cos = 0.99995;
@@ -31,9 +147,6 @@ CpuRefResult cpu_ref_verify(const FmhaParams& p, const FmhaBuffers& bufs) {
     printf("\n=== Verify (CPU reference, all %zu rows x %d dims) ===\n",
            total_rows, Dlog);
 
-    const uint16_t* h_Q = bufs.h_Q.data();
-    const uint16_t* h_K = bufs.h_K.data();
-    const uint16_t* h_V = bufs.h_V.data();
     const uint16_t* h_O = bufs.h_O.data();
 
     double max_abs = 0, max_rel = 0, min_cos = 1.0, sum_cos = 0;
@@ -72,7 +185,7 @@ CpuRefResult cpu_ref_verify(const FmhaParams& p, const FmhaBuffers& bufs) {
 
     #pragma omp parallel
     {
-        std::vector<float> S(Skv), P(Skv);
+        std::vector<float> o_row(Dlog);
         double t_max_abs = 0, t_max_rel = 0, t_min_cos = 1.0, t_sum_cos = 0;
         size_t t_mismatch = 0, t_rel_counted = 0, t_total = 0, t_nonfinite = 0;
         size_t t_cos_rows = 0, t_cos_fail = 0;
@@ -85,72 +198,25 @@ CpuRefResult cpu_ref_verify(const FmhaParams& p, const FmhaBuffers& bufs) {
         for (int b = 0; b < B; b++)
         for (int hq = 0; hq < Hq; hq++)
         for (int i = 0; i < get_sq(b); i++) {
-            const int hkv = hq / p.gqa;
             const int Skv_b = get_skv(b);
-            size_t Q_off, K_base, V_base, O_off;
+            // O offset for reading the kernel output (mirrors the Q offset).
+            size_t O_off;
             if (varlen_mode) {
-                Q_off  = ((size_t)hq  * total_sl + vl_offsets[b] + i) * Dpad;
-                K_base = ((size_t)hkv * total_sl + vl_offsets[b]) * Dpad;
-                V_base = K_base;
-                O_off  = Q_off;
+                O_off = ((size_t)hq * total_sl + vl_offsets[b] + i) * Dpad;
             } else {
-                Q_off  = (((size_t)b * Hq  + hq ) * Sq  + i) * Dpad;
-                K_base = ((size_t)b * Hkv + hkv) * Skv * Dpad;
-                V_base = ((size_t)b * Hkv + hkv) * Skv * Dpad;
-                O_off  = (((size_t)b * Hq  + hq ) * Sq  + i) * Dpad;
+                O_off = (((size_t)b * Hq + hq) * Sq + i) * Dpad;
             }
 
-            // Scores S = (Q . K^T) * scalar, one row of the attention matrix.
-            // Here scalar is the PLAIN 1/sqrt(head_dim) and softmax below is
-            // natural-e (expf) — the log2(e) trick lives only in the GPU kernel,
-            // which uses exp2; both produce the same probabilities.
-            for (int j = 0; j < Skv_b; j++) {
-                float s = 0;
-                for (int d = 0; d < Dlog; d++) {
-                    float q = bf16_to_float(h_Q[Q_off + d]);
-                    float k = bf16_to_float(h_K[K_base + (size_t)j * Dpad + d]);
-                    s += q * k;
-                }
-                S[j] = s * scalar;
-                // Right-aligned causal mask (FA-2 / CK convention): query row i
-                // may attend key j only up to i + (Skv_b - Sq_b); the
-                // (Skv_b - Sq_b) shift aligns the diagonal when k and q lengths
-                // differ.  Masked positions are set to -inf so exp() -> 0.
-                const int Sq_b = get_sq(b);
-                if (p.mask && j > i + (Skv_b - Sq_b)) S[j] = -INFINITY;
-            }
-
-            // Numerically-stable softmax: subtract the row max before exp.
-            float m = S[0];
-            for (int j = 1; j < Skv_b; j++) if (S[j] > m) m = S[j];
-
-            if (m == -INFINITY) {
-                // Entire row masked out (can happen with causal masking); P = 0.
-                for (int j = 0; j < Skv_b; j++) P[j] = 0.0f;
-            } else {
-                float sum = 0;
-                for (int j = 0; j < Skv_b; j++) {
-                    P[j] = (std::isinf(S[j]) && S[j] < 0) ? 0.0f : expf(S[j] - m);
-                    sum += P[j];
-                }
-                float inv_sum = 1.0f / sum;
-                for (int j = 0; j < Skv_b; j++) {
-                    P[j] *= inv_sum;
-                    // Emulate the kernel data path: P is truncated to BF16 and
-                    // widened back before the P.V GEMM (see file header step 3),
-                    // so the reference sees the same rounding as the shader.
-                    P[j] = bf16_to_float(float_to_bf16(P[j]));
-                }
-            }
+            // Per-row attention compute over the FULL KV range [0, Skv_b).
+            // The score -> softmax -> P.V math now lives in cpu_ref_split; this
+            // call reproduces exactly the inlined reference that preceded the
+            // split-K refactor (lse_out=nullptr: LSE is not needed here).
+            cpu_ref_split(p, bufs, b, hq, i, 0, Skv_b, o_row.data(), nullptr);
 
             const bool save_row0 = (b == 0 && hq == 0 && i == 0);
             double dot_rk = 0, norm_r = 0, norm_k = 0;
             for (int d = 0; d < Dlog; d++) {
-                float o_ref = 0;
-                for (int j = 0; j < Skv_b; j++) {
-                    float v = bf16_to_float(h_V[V_base + (size_t)j * Dpad + d]);
-                    o_ref += P[j] * v;
-                }
+                float o_ref = o_row[d];
                 float o_kern = bf16_to_float(h_O[O_off + d]);
                 dot_rk += (double)o_ref * o_kern;
                 norm_r += (double)o_ref * o_ref;

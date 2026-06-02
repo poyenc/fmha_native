@@ -25,6 +25,7 @@ ITERS=20
 NRUNS=6
 DROP=1
 MASK=0
+SPLITK=""   # unset = single-pass (legacy behavior); set = pass --splitk $SPLITK
 
 usage() {
     cat <<'USAGE'
@@ -35,6 +36,7 @@ Runs the full 8-config sweep with 6-run averaging (drop 1st, average 2-5).
 Options:
   --build-dir DIR   Build directory  [default: <repo>/build]
   --mask N          Mask variant 0 (no mask) or 1 (causal)  [default: 0]
+  --splitk G        Split-K split count; appends --splitk G to each run [unset]
   --help            Show this help
 USAGE
     exit 0
@@ -44,6 +46,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --build-dir)  BUILD_DIR="$2"; shift 2 ;;
         --mask)       MASK="$2"; shift 2 ;;
+        --splitk)     SPLITK="$2"; shift 2 ;;
         --help)       usage ;;
         *)            echo "Unknown option: $1" >&2; usage ;;
     esac
@@ -51,7 +54,12 @@ done
 
 resolve_build "${BUILD_DIR:-${REPO_ROOT}/build}"
 
-echo "Benchmark: ${#SWEEP_SIZES[@]} configs (WARMUP=$WARMUP ITERS=$ITERS RUNS=$NRUNS DROP=$DROP MASK=$MASK)"
+# Optional --splitk passthrough: when unset the SPLITK_ARGS array is empty, so the
+# bench invocation below is byte-for-byte identical to the legacy single-pass sweep.
+SPLITK_ARGS=()
+[ -n "$SPLITK" ] && SPLITK_ARGS=(--splitk "$SPLITK")
+
+echo "Benchmark: ${#SWEEP_SIZES[@]} configs (WARMUP=$WARMUP ITERS=$ITERS RUNS=$NRUNS DROP=$DROP MASK=$MASK${SPLITK:+ SPLITK=$SPLITK})"
 [ -n "${HIP_VISIBLE_DEVICES:-}" ] && echo "GPU: HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES"
 echo ""
 
@@ -70,7 +78,7 @@ for cfg in "${SWEEP_SIZES[@]}"; do
     for run_idx in $(seq 1 $NRUNS); do
         set +e
         out=$("$BENCH" -b "$CB" -h "$CH" -s "$CS" -d "$CD" --mask "$MASK" \
-              --warmup "$WARMUP" --iters "$ITERS" 2>&1)
+              --warmup "$WARMUP" --iters "$ITERS" "${SPLITK_ARGS[@]}" 2>&1)
         rc=$?
         set -e
 

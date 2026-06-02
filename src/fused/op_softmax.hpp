@@ -255,19 +255,20 @@ __device__ __forceinline__ void rescale_o_acc(
 }
 
 // ================================================================
-// Legacy functions — used by current _device.hpp until Task 2.6.
-// DO NOT use in new Phase 2 code. Will be removed after 2.6.
+// Legacy functions — DEAD CODE, kept for reference (no live caller).
 //
 // These are the PRE-online-softmax variants. They differ from the live path
 // above in two ways: (1) they produce/consume a per-register array (one max/sum
 // per register slot instead of a single per-row scalar), and (2) they reduce with
 // a full log2(32) butterfly of ds_bpermutes instead of the single lane^32
-// exchange the TransposedC layout makes sufficient. The fused pipeline does NOT
-// call any of these; they survive only so the old _device.hpp entry still
-// compiles, and are slated for removal. New readers can skip this block.
+// exchange the TransposedC layout makes sufficient. They were called by an old
+// `_device.hpp` entry that has since been removed; nothing in src/ or tests/
+// references them now (the live pipeline.hpp uses the scalar softmax_row_max /
+// softmax_row_sum / softmax_exp2 above). `inline` so they emit no code while
+// uncalled. New readers can skip this block.
 // ================================================================
 
-// Old softmax_row_max with array output (used by current device.hpp)
+// Old softmax_row_max with array output (no live caller; see banner above)
 __device__ __forceinline__ void softmax_row_max(float (&row_max)[16],
                                        const v16f& s_acc_n0,
                                        const v16f& s_acc_n1,

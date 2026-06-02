@@ -294,14 +294,16 @@ __device__ __forceinline__ void gemm1_subtile(
 }
 
 // ================================================================
-// Legacy functions — used by current _device.hpp until Task 2.6.
-// DO NOT use in new Phase 2 code. Will be removed after 2.6.
+// Legacy functions — DEAD CODE, kept for reference (no live caller).
 //
 // gemm0() here is the pre-sub-tile GEMM0 (full 64-deep headdim in one call, old
 // k_lds_offset layout, no SwizzleA). gemm1_bpermute() is the pre-MFMA GEMM1: a
 // scalar FMA loop that broadcasts P across lanes with ds_bpermute instead of the
-// P.V MFMA. Both are superseded by gemm0_subtile / gemm1_subtile above; kept
-// only so the old device entry compiles. New readers can skip this block.
+// P.V MFMA. Both are superseded by gemm0_subtile / gemm1_subtile above. They
+// were called by an old `_device.hpp` entry that has since been removed; nothing
+// in src/ or tests/ references them now (the live pipeline.hpp calls
+// gemm0_subtile). `inline` so they emit no code while uncalled. New readers can
+// skip this block.
 // ================================================================
 
 __device__ inline void gemm0(v16f& s_acc_n0, v16f& s_acc_n1,

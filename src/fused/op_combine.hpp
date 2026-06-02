@@ -27,12 +27,12 @@
 //
 // WHY NO swz HERE (★ critical layout fact)
 //   The scratch is stored in NATURAL head-dim order: scratch_o[g][b][h][row][d]
-//   has d == the natural head-dim index 0..63. (The split *producer* — the future
-//   epilog_store_split — un-swizzles the GEMM-inherited register layout BEFORE
-//   writing scratch, so the combine consumes already-natural planes.) Therefore
-//   the combine reads scratch plane element d and writes O column d DIRECTLY: it
-//   must NOT run d through swz(). Applying swz here would permute the columns and
-//   break the real-partial (Source B) invariance test.
+//   has d == the natural head-dim index 0..63. (The split *producer*
+//   epilog_store_split (op_epilog.hpp) un-swizzles the GEMM-inherited register
+//   layout BEFORE writing scratch, so the combine consumes already-natural
+//   planes.) Therefore the combine reads scratch plane element d and writes O
+//   column d DIRECTLY: it must NOT run d through swz(). Applying swz here would
+//   permute the columns and break the real-partial (Source B) invariance test.
 //
 // LAUNCH CONTRACT (mirrors the forward kernel; see test_combine.cpp header)
 //   Grid : dim3(nhead_q, m_tiles, batch)  — one block per (b, h, m_tile),
@@ -43,8 +43,8 @@
 //          R = m_tile * kM0 + row,  valid only while R < seqlen_q.
 //
 // ROW -> THREAD MAPPING (deliberately the SIMPLEST correct one)
-//   This pass is memory-light and runs once; it is NOT perf-gated for the GREEN
-//   step (perf tuning is T7/T9). So we use the most obviously-correct mapping:
+//   This pass is memory-light and runs once; it is NOT perf-gated (the combine
+//   measures ~3% of GPU time). So we use the most obviously-correct mapping:
 //       row = threadIdx.x         (one query row per thread)
 //   The block has kBlockSize(=256) threads but a tile is only kM0(=128) rows, so
 //   threads 0..127 each own exactly one row and threads 128..255 idle. Each
@@ -56,7 +56,7 @@
 //   The combine struct does not carry the batch count B, but the split-major
 //   g-stride needs it. B == gridDim.z (the grid's batch axis), so we recover it
 //   from the launch geometry. The decode b = blockIdx.z + the batch_stride_o term
-//   make B>1 correct even though the GREEN test only exercises B=1.
+//   make B>1 correct (test_combine's core case is B=1; the e2e tests cover B=2).
 
 // Convex-combination combine for ONE output tile.
 //   p       : combine kernarg block (scratch pointers, O pointer + strides, G).
@@ -207,9 +207,9 @@ __device__ __forceinline__ void combine_split(
         for (int d = 0; d < kD; ++d) p.o_fp32[of_base + d] = acc[d];
     }
 
-    // Optional global LSE: L* = M + ln(denom) in natural units. Not gated by the
-    // GREEN test (params.lse == nullptr there); implemented for completeness and
-    // guarded so a null pointer never faults.
+    // Optional global LSE: L* = M + ln(denom) in natural units. The split-K
+    // bench/e2e callers pass params.lse == nullptr, so this is untested but
+    // implemented for completeness and guarded so a null pointer never faults.
     if (p.lse) {
         // Recompute denom cheaply (kept out of the hot path above to avoid a live
         // register across the O accumulation); M is finite here unless all-empty.

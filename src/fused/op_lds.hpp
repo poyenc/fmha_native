@@ -354,14 +354,13 @@ __device__ __forceinline__ void store_v_to_lds(
 }
 
 // ================================================================
-// Legacy functions — used by current _device.hpp until Task 2.6 rewrites it.
-// DO NOT use in new Phase 2 code. Will be removed after 2.6.
+// Legacy functions — DEAD CODE, kept for reference (no live caller).
 //
 // These are the pre-async-copy K staging path: a synchronous DRAM->VGPR
 // buffer_load_b128 followed by a manual VGPR->LDS store, using a different LDS
-// layout (k_lds_offset). The production pipeline (pipeline.hpp) does not call
-// these; they exist only so the older device entry still compiles. New readers
-// can skip this block — the live K staging is async_copy_k_subtile above.
+// layout (k_lds_offset). They were called by an old `_device.hpp` entry that has
+// since been removed; nothing in src/ or tests/ references them now (the live K
+// staging is async_copy_k_subtile above). New readers can skip this block.
 // ================================================================
 
 __device__ __forceinline__ int k_lds_offset(int n, int k) {

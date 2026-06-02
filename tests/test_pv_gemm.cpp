@@ -143,6 +143,9 @@ void compare_exact(const std::vector<float>& got, const std::vector<float>& exp,
 
 } // namespace
 
+// ---- Full + partial tile tests ----
+// Partial (sq=17,sk=33) exercises the OOB-zero padding path the full tile cannot.
+
 TEST(PvGemmFullTile, MatchesCpuRef) {
     const int sq = 64, sk = 64, D = 64;
     auto p = compute_p(sq, sk, D);
@@ -192,6 +195,9 @@ TEST(PvGemmPartialTile, MatchesGolden) {
 }
 
 // ---- Edge case tests (CPU ref only) ----
+// Degenerate tile shapes that stress the partial-tile guards: 1x1 (MinTile),
+// a full 128-row M-tile (FullM0), and a single key column (SingleKCol). All
+// diff vs cpu_ref_pv_gemm; no golden dump exists for these shapes.
 
 TEST(PvGemmEdge, MinTile) {
     const int sq=1, sk=1, D=64;

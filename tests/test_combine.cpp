@@ -123,9 +123,15 @@ struct CombineDims {
     int Sq;       // query rows
 };
 
+// o_fp32_out (optional): when non-null, ALSO request the kernel's exact fp32
+// convex-combination output (the un-truncated O the bf16 store rounds) via the
+// new cp.o_fp32 tap, copy it back, and return it through *o_fp32_out (resized to
+// n_o). Existing callers pass nothing → o_fp32_out == nullptr → cp.o_fp32 stays
+// null → the bf16 path is byte-identical.
 std::vector<float> run_combine(const CombineDims& dim,
                                const std::vector<float>& scratch_o,   // [G*B*Hq*Sq*D]
-                               const std::vector<float>& scratch_lse) // [G*B*Hq*Sq]
+                               const std::vector<float>& scratch_lse, // [G*B*Hq*Sq]
+                               std::vector<float>* o_fp32_out = nullptr)
 {
     const int G = dim.G, B = dim.B, Hq = dim.Hq, Sq = dim.Sq;
     const size_t n_o     = (size_t)B * Hq * Sq * kD;       // final O elements
@@ -158,6 +164,15 @@ std::vector<float> run_combine(const CombineDims& dim,
     cp.batch_stride_o  = Hq * Sq * kD;
     cp.scale       = 1.0f;              // only used for global LSE (unused here)
 
+    // Optional fp32 tap: allocate a contiguous [B][Hq][Sq][64] fp32 buffer and
+    // point cp.o_fp32 at it so the kernel writes the exact convex combination.
+    void* dOf32 = nullptr;
+    if (o_fp32_out) {
+        EXPECT_EQ(hipMalloc(&dOf32, n_o * sizeof(float)), hipSuccess);
+        EXPECT_EQ(hipMemset(dOf32, 0, n_o * sizeof(float)), hipSuccess);
+        cp.o_fp32 = reinterpret_cast<float*>(dOf32);
+    }
+
     // Grid mirrors the forward kernel: (Hq, m_tiles, B), kBlockSize threads.
     const int m_tiles = (Sq + kM0 - 1) / kM0;
     dim3 grid(Hq, m_tiles, B);
@@ -172,6 +187,13 @@ std::vector<float> run_combine(const CombineDims& dim,
 
     std::vector<float> o_f32(n_o);
     for (size_t i = 0; i < n_o; ++i) o_f32[i] = bf16_to_float(o_bf16[i]);
+
+    if (o_fp32_out) {
+        o_fp32_out->resize(n_o);
+        EXPECT_EQ(hipMemcpy(o_fp32_out->data(), dOf32, n_o * sizeof(float),
+                            hipMemcpyDeviceToHost), hipSuccess);
+        hipFree(dOf32);
+    }
 
     hipFree(dScO); hipFree(dScLse); hipFree(dO);
     return o_f32;
@@ -257,8 +279,11 @@ TEST(CombineSynthetic, AdversarialPatterns) {
             }
         }
 
-        // GPU combine over the whole (B=1,Hq=1,Sq) problem.
-        std::vector<float> gpu_o = run_combine({G, B, Hq, Sq}, scratch_o, scratch_lse);
+        // GPU combine over the whole (B=1,Hq=1,Sq) problem. Also request the exact
+        // fp32 tap so we can check the combine math BELOW the bf16 store rounding.
+        std::vector<float> gpu_of32;
+        std::vector<float> gpu_o =
+            run_combine({G, B, Hq, Sq}, scratch_o, scratch_lse, &gpu_of32);
 
         // CPU oracle per row: gather the G planes (range-major) for this row.
         std::vector<float> exp_o(n_o, 0.0f);
@@ -277,6 +302,13 @@ TEST(CombineSynthetic, AdversarialPatterns) {
         std::string label = "synthetic/G=" + std::to_string(G);
         // fp32 combine is exact; allow only BF16 store rounding (< 1e-3).
         compare_max_abs(gpu_o, exp_o, label.c_str(), 1e-3f);
+
+        // TIGHTER fp32 check vs the SAME cpu_ref_combine oracle: the fp32 tap is the
+        // exact convex combination BEFORE truncation, so the only deltas are
+        // expf/double→float ULPs at o_part magnitude ~0.01 → ~1e-6..1e-7. This
+        // catches reweight-weight bugs the bf16 (~1e-3) bound would round away.
+        std::string flabel = "synthetic-fp32/G=" + std::to_string(G);
+        compare_max_abs(gpu_of32, exp_o, flabel.c_str(), 1e-5f);
 
         // G=1 identity: output row must equal o_part[0] (modulo bf16 store).
         if (G == 1) {
@@ -364,12 +396,38 @@ TEST(CombineRealPartial, GInvariance) {
             }
         }
 
-        std::vector<float> gpu_o = run_combine({G, B, Hq, Sq}, scratch_o, scratch_lse);
+        std::vector<float> gpu_of32;
+        std::vector<float> gpu_o =
+            run_combine({G, B, Hq, Sq}, scratch_o, scratch_lse, &gpu_of32);
 
         std::string label = "real/G=" + std::to_string(G);
         // 2e-3 absorbs per-range BF16 P-truncation drift (T1 note); the fp32
         // combine reweighting itself is exact.
         compare_max_abs(gpu_o, full_o, label.c_str(), 2e-3f);
+
+        // TIGHTER fp32 check vs cpu_ref_combine of the SAME scratch arrays (NOT vs
+        // full_o). RATIONALE: the per-range bf16-P drift lives in BOTH the GPU
+        // combine input AND this cpu_ref_combine input (the SAME scratch_o/lse) →
+        // it CANCELS; the residual is only device-vs-host combine arithmetic →
+        // ~1e-5. (Comparing the fp32 tap vs full_o would instead EXPOSE that ~2e-3
+        // input drift — wrong comparison; full_o is the un-split reference, not the
+        // combine of these partials.) Mirrors the synthetic gather, for B=1,Hq=2.
+        std::vector<float> exp_combine((size_t)Hq * Sq * kD, 0.0f);
+        std::vector<float> o_part((size_t)G * kD), lse_part(G);
+        for (int h = 0; h < Hq; ++h) {
+            for (int row = 0; row < Sq; ++row) {
+                for (int g = 0; g < G; ++g) {
+                    lse_part[g] = scratch_lse[scratch_lse_idx(g, 0, h, row, B, Hq, Sq)];
+                    for (int d = 0; d < kD; ++d)
+                        o_part[g * kD + d] =
+                            scratch_o[scratch_o_idx(g, 0, h, row, d, B, Hq, Sq)];
+                }
+                cpu_ref_combine(G, kD, o_part.data(), lse_part.data(),
+                                exp_combine.data() + ((size_t)h * Sq + row) * kD);
+            }
+        }
+        std::string flabel = "real-fp32/G=" + std::to_string(G);
+        compare_max_abs(gpu_of32, exp_combine, flabel.c_str(), 1e-5f);
     }
 }
 

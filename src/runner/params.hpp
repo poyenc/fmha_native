@@ -92,6 +92,15 @@ struct FmhaFwdCombineParams {
     int seqlen_q, nhead_q;
     int stride_o, nhead_stride_o, batch_stride_o;
     float scale;               // params.scale (base-2, log2e-folded) — for global LSE only
+    // OPTIONAL fp32 output (split-K combine precision check). When non-null, the
+    // combine ALSO writes the exact fp32 convex-combination result (before bf16
+    // truncation) here, in NATURAL head-dim order, CONTIGUOUS [B][Hq][Sq][64]:
+    //   o_fp32 index (b,h,R,d) = (((b*Hq + h)*Sq + R)*64 + d
+    // This is the un-truncated O the bf16 store rounds — tests compare it to
+    // cpu_ref_combine at ~1e-5 to catch reweight-weight bugs the bf16 (~1e-3)
+    // bound would hide. nullptr (the default for all value-init `cp{}` callers,
+    // e.g. bench + run_combine_e2e) disables it → the bf16 path is byte-identical.
+    float* o_fp32 = nullptr;
 };
 
 // Kernarg block for the split-K *forward* pass (the IsSplit=true variant of the

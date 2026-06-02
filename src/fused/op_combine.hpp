@@ -112,6 +112,12 @@ __device__ __forceinline__ void combine_split(
         (long)b * p.batch_stride_o + (long)h * p.nhead_stride_o + (long)R * p.stride_o;
     uint16_t* o_u16 = reinterpret_cast<uint16_t*>(p.o);
 
+    // Optional fp32 precision tap (p.o_fp32 != nullptr): the EXACT fp32 result the
+    // bf16 store rounds, in its OWN CONTIGUOUS natural-order layout [B][Hq][Sq][64]
+    // (NOT the strided bf16 o_row_base). Tests compare this to cpu_ref_combine at
+    // ~1e-5 to catch reweight-weight bugs the bf16 (~1e-3) store tolerance hides.
+    const long of_base = (((long)(b * Hq + h) * Sq + R) * kD);
+
     if (G == 1) {
         const float* o0 = p.scratch_o + bh_row * kD;   // plane 0, this (b,h,R)
         #pragma unroll
@@ -121,6 +127,12 @@ __device__ __forceinline__ void combine_split(
             unsigned packed = __builtin_amdgcn_perm(
                 0u, reinterpret_cast<unsigned&>(v), kBf16TruncSel);
             o_u16[o_row_base + d] = (uint16_t)(packed & 0xFFFFu);
+        }
+        // Optional fp32 tap: with one split the result is plane 0 verbatim — write
+        // the un-truncated o0[d] in natural order (guarded by null; off by default).
+        if (p.o_fp32) {
+            #pragma unroll
+            for (int d = 0; d < kD; ++d) p.o_fp32[of_base + d] = o0[d];
         }
         // Optional global LSE: with one split, LSE == the single plane's LSE.
         if (p.lse) {
@@ -184,6 +196,15 @@ __device__ __forceinline__ void combine_split(
         unsigned packed = __builtin_amdgcn_perm(
             0u, reinterpret_cast<unsigned&>(v), kBf16TruncSel);
         o_u16[o_row_base + d] = (uint16_t)(packed & 0xFFFFu);
+    }
+
+    // Optional fp32 tap: write the EXACT convex-combination accumulator acc[] in
+    // natural order BEFORE the bf16 truncation above — this is the whole point of
+    // the tap (it exposes reweight-weight errors the bf16 store would round away).
+    // Guarded by null; the default-null callers leave the bf16 path byte-identical.
+    if (p.o_fp32) {
+        #pragma unroll
+        for (int d = 0; d < kD; ++d) p.o_fp32[of_base + d] = acc[d];
     }
 
     // Optional global LSE: L* = M + ln(denom) in natural units. Not gated by the

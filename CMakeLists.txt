@@ -55,8 +55,10 @@ set_source_files_properties(
     src/fused/kernel.cpp
     PROPERTIES LANGUAGE HIP)
 
-# Test: GPU ref vs CPU ref
-add_executable(test_fmha_gpu_ref tests/test_fmha_gpu_ref.cpp)
+# Test: GPU ref vs CPU ref (incl. Stage-1 split-K oracle trust:
+# cpu_ref_combine is compiled in here because it lives in components_ref and is
+# not part of fmha_runner).
+add_executable(test_fmha_gpu_ref tests/test_fmha_gpu_ref.cpp src/components_ref/cpu_ref_combine.cpp)
 target_link_libraries(test_fmha_gpu_ref PRIVATE fmha_runner GTest::gtest_main)
 target_link_options(test_fmha_gpu_ref PRIVATE -fopenmp)
 set_source_files_properties(tests/test_fmha_gpu_ref.cpp PROPERTIES LANGUAGE HIP)

@@ -189,7 +189,7 @@ __device__ __forceinline__ void async_copy_k_subtile(
     char* lds,
     __amdgpu_buffer_rsrc_t k_srd,
     int stride_k,         // in bf16 elements
-    int kv_offset,        // row offset into seqlen_k for this tile
+    int kv_byte_base,     // kv_offset * stride_k * 2, precomputed by caller (induction var)
     int k_col_offset,     // column offset (0 or 32) selecting which k0 half
     int buf_idx)
 {
@@ -202,6 +202,22 @@ __device__ __forceinline__ void async_copy_k_subtile(
     const int stride_bytes = stride_k * 2;               // bf16 stride -> bytes
     const int m0_base = buf_base_bytes(buf_idx) + warp_id * 0x110;
 
+    // Source byte offset of K[kv_offset + n_base, k_col_offset + d_in_chunk] for
+    // issue 0. The tile-VARIANT part (kv_offset*stride) arrives pre-multiplied as
+    // kv_byte_base, so no per-tile multiply by kv_offset remains.
+    //
+    // WHY A RUNNING RECURRENCE (voffset += step) instead of recomputing
+    // kv_byte_base + (issue*16 + n_base)*stride per issue: the per-issue offsets
+    // (n_base*stride, +16*stride, ...) are loop-invariant, so writing them as
+    // independent expressions lets the compiler HOIST all four out of the tile
+    // loop into four persistent VGPRs. At the occ-4 VGPR ceiling (128, zero
+    // headroom) that overflows and forces a hot-loop scratch spill of an m0
+    // value, which serializes the async copy. Seeding voffset from kv_byte_base
+    // (the per-tile IV) and chaining +=16*stride makes the four values depend on
+    // the IV, so the compiler threads them through ONE working register — the
+    // same single-recurrence shape the V path and the original K codegen used.
+    int voffset = kv_byte_base + n_base * stride_bytes + (k_col_offset + d_in_chunk) * 2;
+
     #pragma unroll
     for (int issue = 0; issue < 4; ++issue) {
         // LDS destination for this issue. lds_dst becomes the per-wave m0 base;
@@ -209,16 +225,12 @@ __device__ __forceinline__ void async_copy_k_subtile(
         const int m0_bytes = m0_base + issue * 0x440;
         lds_ptr_t lds_dst = (lds_ptr_t)(lds + m0_bytes);
 
-        // DRAM source: byte offset of K[row, k_col_offset + d_in_chunk] for the
-        // selected headdim half (k_col_offset = 0 or kK0=32). *2 = bf16->bytes.
-        const int n_pos = issue * 16 + n_base;
-        const int row = kv_offset + n_pos;
-        const int voffset = row * stride_bytes + (k_col_offset + d_in_chunk) * 2;
-
         // size=4: one dword (2 bf16) per lane per issue. Bumps vmcnt; does not
         // touch any VGPR — data flows DRAM -> LDS directly.
         __builtin_amdgcn_raw_ptr_buffer_load_lds(
             k_srd, lds_dst, /*size=*/4, voffset, /*soffset=*/0, /*offset=*/0, /*aux=*/0);
+
+        voffset += 16 * stride_bytes;   // next issue is 16 seqlen_k rows down
     }
 }
 

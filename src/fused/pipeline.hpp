@@ -263,6 +263,11 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     const int v_stride_bytes = params.stride_v * 2;
     int kv_v_byte = kv_offset * v_stride_bytes;
 
+    // K byte-base induction variable: same transform as the V one above, for the
+    // async DRAM->LDS K copies. Also wave-uniform -> SGPR.
+    const int k_stride_bytes = params.stride_k * 2;
+    int kv_k_byte = kv_offset * k_stride_bytes;
+
     // After Q load, before K prefetch — match CK prologue barriers 1-2.
     // (sched_barriers are codegen/parity fences, ~0% perf — see file header.)
     __builtin_amdgcn_sched_barrier(0);
@@ -270,7 +275,7 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
 
     // ---- PROLOGUE: kick off the first K sub-tile copy (headdim half 0) so the
     // first GEMM0 has data. Async (vmcnt only); the loop fences it before reading.
-    async_copy_k_subtile(lds, srd_k, params.stride_k, kv_offset, k_col_offset, LdsSeq[0]);
+    async_copy_k_subtile(lds, srd_k, params.stride_k, kv_k_byte, k_col_offset, LdsSeq[0]);
     k_col_offset += kK0;
 
     __builtin_amdgcn_sched_barrier(0); // prologue barrier 3
@@ -288,7 +293,7 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             // Prefetch K headdim half 1 (buffer LdsSeq[1]) while half 0 is still
             // in flight, then drain to <=4 outstanding and barrier so half 0 is
             // visible, and run GEMM0 sub-tile 0 (consumes half 0 from LdsSeq[0]).
-            async_copy_k_subtile(lds, srd_k, params.stride_k, kv_offset, k_col_offset, LdsSeq[1]);
+            async_copy_k_subtile(lds, srd_k, params.stride_k, kv_k_byte, k_col_offset, LdsSeq[1]);
             k_col_offset += kK0;
             async_load_fence(4);
             s_barrier();
@@ -377,9 +382,10 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             if (i_total_loops < num_total_loop) {
                 kv_offset += kN0;
                 kv_v_byte += kN0 * v_stride_bytes;   // advance V byte-base by a loop constant
+                kv_k_byte += kN0 * k_stride_bytes;   // advance K byte-base (used by the prefetch below)
                 k_col_offset = 0;
                 s_barrier();
-                async_copy_k_subtile(lds, srd_k, params.stride_k, kv_offset, k_col_offset, LdsSeq[0]);
+                async_copy_k_subtile(lds, srd_k, params.stride_k, kv_k_byte, k_col_offset, LdsSeq[0]);
                 k_col_offset += kK0;
             }
 

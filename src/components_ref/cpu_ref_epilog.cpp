@@ -1,3 +1,5 @@
+// CPU oracle for the epilogue component — see cpu_ref_epilog.hpp for the layout
+// derivation (normalize by RSUM, bf16-truncate, swz()-permuted DRAM scatter).
 #include "components_ref/cpu_ref_epilog.hpp"
 #include "runner/bf16_utils.hpp"
 #include <cstring>

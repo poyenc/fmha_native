@@ -1,3 +1,6 @@
+// CPU oracle for the row-max component — see cpu_ref_row_max.hpp for the
+// TransposedC layout. Gathers both k_sub halves of each M-row and takes the
+// plain max over all 64 columns, skipping the GPU's ds_bpermute shuffle.
 #include "components_ref/cpu_ref_row_max.hpp"
 #include <cmath>
 #include <algorithm>

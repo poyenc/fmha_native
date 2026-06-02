@@ -1,3 +1,6 @@
+// CPU oracle for the K-LDS staging component — see cpu_ref_k_lds.hpp for the
+// golden offset formula. Builds the expected LDS byte image for the GPU's
+// swizzled K copy; the test byte-compares the GPU's dumped LDS against it.
 #include "components_ref/cpu_ref_k_lds.hpp"
 #include <cstring>
 

@@ -1,3 +1,6 @@
+// CPU oracle for the V-LDS staging component — see cpu_ref_v_lds.hpp for the
+// golden offset formula. Writes the staged+transposed V image straight to its
+// final LDS slot, skipping the GPU's load/v_perm/ds_write dance.
 #include "components_ref/cpu_ref_v_lds.hpp"
 #include <cstring>
 

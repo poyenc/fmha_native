@@ -98,6 +98,17 @@ extern __global__ void fmha_fwd_d64_bf16_msk1_split(FmhaFwdSplitParams);
 // ---------------------------------------------------------------------------
 extern __global__ void fmha_fwd_d64_bf16_combine(FmhaFwdCombineParams);
 
+// ---------------------------------------------------------------------------
+// The SINGLE-PASS production forward kernels (defined in src/fused/kernel.cpp,
+// same extern style as src/bench_fmha_fwd.cpp).  These are the dense nomask /
+// causal entries that the 67-test fused suite gates BIT-EXACT against the CK
+// golden dumps — i.e. the most-trusted O reference in this repo.  The new
+// MatchesSinglePass test below compares the split+combine pipeline O against
+// THESE, rather than against the hand-written gpu_ref oracle.
+// ---------------------------------------------------------------------------
+extern __global__ void fmha_fwd_d64_bf16_msk0(FmhaFwdParams);
+extern __global__ void fmha_fwd_d64_bf16_msk1(FmhaFwdParams);
+
 namespace {
 
 constexpr int kD = 64;            // head_dim this kernel is specialized for
@@ -326,6 +337,29 @@ void run_combine_e2e(const SplitDims& dim, float scale,
     dim3 grid(Hq, m_tiles, B);            // forward grid: one block per (b,h,m_tile)
     dim3 block(kBlockSize);
     hipLaunchKernelGGL(fmha_fwd_d64_bf16_combine, grid, block, 0, nullptr, cp);
+    ASSERT_EQ(hipGetLastError(), hipSuccess);
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+}
+
+// ---------------------------------------------------------------------------
+// Launch the SINGLE-PASS production forward kernel into a SEPARATE bf16 O
+// buffer, reading the SAME device Q/K/V the pipeline read.  `base` is taken BY
+// VALUE so overriding .o/.lse is local to this call and never mutates the
+// caller's params.  Grid mirrors kernel.cpp: (Hq, m_tiles, B).  The single-pass
+// kernel writes O in the same natural head-dim DRAM layout as the combine, so
+// the result is elementwise-comparable to the pipeline O.
+// ---------------------------------------------------------------------------
+void run_single_pass(bool mask, FmhaFwdParams base, const SplitDims& dim,
+                     __hip_bfloat16* d_o_single) {
+    base.o   = d_o_single;
+    base.lse = nullptr;
+    const int m_tiles = (dim.Sq + kM0 - 1) / kM0;
+    dim3 grid(dim.Hq, m_tiles, dim.B);
+    dim3 block(kBlockSize);
+    if (mask)
+        hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk1, grid, block, 0, nullptr, base);
+    else
+        hipLaunchKernelGGL(fmha_fwd_d64_bf16_msk0, grid, block, 0, nullptr, base);
     ASSERT_EQ(hipGetLastError(), hipSuccess);
     ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 }
@@ -931,6 +965,112 @@ TEST(SplitCombineE2E, MatchesFullAttention) {
         const double rel_l2  = refnorm > 0.0 ? std::sqrt(sse) / refnorm : INFINITY;
 
         fprintf(stderr, "[E2E mask=%d B=%d G=%d S=%d] max_abs=%.6g cos=%.8f rel_l2=%.6g\n",
+                c.mask, B, c.G, Sq, max_abs, cos, rel_l2);
+        EXPECT_GE(cos,    kCosTol)   << "cosine below gate (structural/wiring bug?)";
+        EXPECT_LE(rel_l2, kRelL2Tol) << "relative L2 above gate (magnitude/wiring bug?)";
+    }
+}
+
+// ===========================================================================
+// END-TO-END — split+combine pipeline O  vs  SINGLE-PASS production kernel O.
+//
+// WHY a second e2e test, and why this reference is STRONGER:
+//   MatchesFullAttention (above) checks the pipeline against `gpu_ref_fmha_fwd`,
+//   a HAND-WRITTEN attention oracle in this repo.  That oracle is convenient for
+//   large S but it is only as trustworthy as our own re-derivation of the math
+//   — a bug shared by oracle and pipeline could hide.  This test removes that
+//   single point of trust by comparing the SAME pipeline O against the
+//   single-pass production kernels `fmha_fwd_d64_bf16_msk0` / `_msk1`.  Those
+//   kernels are gated BIT-EXACT against the CK golden dumps by the 67-test fused
+//   suite (`run-gates.sh`), so they are the most-trusted O reference available
+//   here: CK is the external ground truth, not our own code.
+//
+// WHY the outputs are directly comparable (no re-layout):
+//   Both the combine kernel and the single-pass kernel write O in NATURAL
+//   head-dim order to DRAM (both use epilog selector 0x07060302; epilog_store's
+//   col_base=swz(k_sub*8) un-swizzles back to natural order).  And both consume
+//   the SAME contiguous BHSD strides we hand them via make_base_params /
+//   run_combine_e2e.  So the two final O buffers are elementwise-comparable with
+//   no permutation — we read both back as uint16_t bf16 and diff them directly.
+//
+// RELATIONSHIP to MatchesFullAttention:
+//   This test REPLACES reliance on the bespoke gpu_ref oracle as the primary
+//   correctness witness for the pipeline.  MatchesFullAttention is intentionally
+//   KEPT for extra, independent coverage (a different reference path, and it
+//   exercises gpu_ref itself) — but a green MatchesSinglePass is the stronger
+//   signal because its reference is externally (CK-) anchored.
+//
+// METHOD: identical to MatchesFullAttention — same kE2ECases, same seed scheme,
+// same pipeline launch, same two scale-aware gates (cos ≥ 0.99995 AND
+// rel_l2 ≤ 2e-2).  Only the reference O differs (single-pass instead of oracle).
+// A correct pipeline sits at cos≈0.99999 / rel_l2≈0.3% (bf16 noise floor); any
+// wiring/scale bug trips at least one gate.
+// ===========================================================================
+TEST(SplitCombineE2E, MatchesSinglePass) {
+    // The two scale-aware gates (identical to MatchesFullAttention / bench).
+    constexpr double kCosTol   = 0.99995;  // directional / structural
+    constexpr double kRelL2Tol = 2e-2;     // magnitude (2% rel L2)
+
+    for (const E2ECase& c : kE2ECases) {
+        const bool mask = (c.mask != 0);
+        FmhaParams p{};
+        p.batch = c.B; p.q_heads = 2; p.kv_heads = 2; p.gqa = 1;
+        p.seq_len = c.S; p.kv_seq_len = c.S; p.head_dim = kD; p.mask = c.mask;
+
+        const int B = p.batch, Hq = p.q_heads, Sq = p.seq_len;
+        SCOPED_TRACE(testing::Message() << "mask=" << c.mask << " B=" << B
+                                        << " G=" << c.G << " S=" << Sq);
+
+        // SAME random problem + seed scheme as MatchesFullAttention, so a failure
+        // here vs there is attributable to the reference, not the input.
+        FmhaBuffers bufs(p);
+        bufs.fill_random(1234 + c.mask * 100 + c.B * 10 + c.G);
+        bufs.copy_to_device();
+        FmhaFwdParams base = make_base_params(p, bufs);
+
+        // --- Pipeline: real split → real combine through shared device scratch.
+        float *d_sco = nullptr, *d_sclse = nullptr;
+        run_split_keep_scratch(mask, base, {c.G, B, Hq, Sq}, &d_sco, &d_sclse);
+
+        const size_t n_o = (size_t)B * Hq * Sq * kD;
+        __hip_bfloat16* d_o_pipe = nullptr;
+        ASSERT_EQ(hipMalloc(&d_o_pipe, n_o * sizeof(__hip_bfloat16)), hipSuccess);
+        ASSERT_EQ(hipMemset(d_o_pipe, 0, n_o * sizeof(__hip_bfloat16)), hipSuccess);
+        run_combine_e2e({c.G, B, Hq, Sq}, base.scale, d_sco, d_sclse, d_o_pipe);
+        hipFree(d_sco); hipFree(d_sclse);
+
+        // --- Reference: single-pass production kernel from the SAME Q/K/V into a
+        // SEPARATE O buffer (G is irrelevant to single-pass but harmless here).
+        __hip_bfloat16* d_o_single = nullptr;
+        ASSERT_EQ(hipMalloc(&d_o_single, n_o * sizeof(__hip_bfloat16)), hipSuccess);
+        ASSERT_EQ(hipMemset(d_o_single, 0, n_o * sizeof(__hip_bfloat16)), hipSuccess);
+        run_single_pass(mask, base, {c.G, B, Hq, Sq}, d_o_single);
+
+        // --- Pull both final O buffers back (bf16 → fp32) and compare.
+        std::vector<uint16_t> h_pipe(n_o), h_single(n_o);
+        ASSERT_EQ(hipMemcpy(h_pipe.data(),   d_o_pipe,   n_o * sizeof(uint16_t),
+                            hipMemcpyDeviceToHost), hipSuccess);
+        ASSERT_EQ(hipMemcpy(h_single.data(), d_o_single, n_o * sizeof(uint16_t),
+                            hipMemcpyDeviceToHost), hipSuccess);
+        hipFree(d_o_pipe); hipFree(d_o_single);
+
+        // Scale-aware metrics over all B*Hq*Sq*D elements (== MatchesFullAttention).
+        double max_abs = 0.0, dot = 0.0, na = 0.0, nb = 0.0, sse = 0.0;
+        for (size_t i = 0; i < n_o; ++i) {
+            const double a = bf16_to_float(h_pipe[i]);
+            const double b = bf16_to_float(h_single[i]);
+            const double diff = a - b;
+            if (std::fabs(diff) > max_abs) max_abs = std::fabs(diff);
+            sse += diff * diff;
+            dot += a * b; na += a * a; nb += b * b;
+        }
+        const double denom   = std::sqrt(na) * std::sqrt(nb);
+        const double cos     = denom > 0.0 ? dot / denom : 1.0;
+        const double refnorm = std::sqrt(nb);
+        const double rel_l2  = refnorm > 0.0 ? std::sqrt(sse) / refnorm : INFINITY;
+
+        fprintf(stderr,
+                "[E2E-singlepass mask=%d B=%d G=%d S=%d] max_abs=%.6g cos=%.8f rel_l2=%.6g\n",
                 c.mask, B, c.G, Sq, max_abs, cos, rel_l2);
         EXPECT_GE(cos,    kCosTol)   << "cosine below gate (structural/wiring bug?)";
         EXPECT_LE(rel_l2, kRelL2Tol) << "relative L2 above gate (magnitude/wiring bug?)";

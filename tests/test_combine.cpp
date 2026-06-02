@@ -305,10 +305,12 @@ TEST(CombineSynthetic, AdversarialPatterns) {
 
         // TIGHTER fp32 check vs the SAME cpu_ref_combine oracle: the fp32 tap is the
         // exact convex combination BEFORE truncation, so the only deltas are
-        // expf/double→float ULPs at o_part magnitude ~0.01 → ~1e-6..1e-7. This
-        // catches reweight-weight bugs the bf16 (~1e-3) bound would round away.
+        // expf/double→float ULPs at o_part magnitude ~0.01. MEASURED worst case
+        // across all G (gfx942, deterministic): 3.73e-9. Bound = 1e-8 (~2.7x the
+        // observed worst) — three orders tighter than the old 1e-5 design target,
+        // catching reweight-weight bugs the bf16 (~1e-3) bound would round away.
         std::string flabel = "synthetic-fp32/G=" + std::to_string(G);
-        compare_max_abs(gpu_of32, exp_o, flabel.c_str(), 1e-5f);
+        compare_max_abs(gpu_of32, exp_o, flabel.c_str(), 1e-8f);
 
         // G=1 identity: output row must equal o_part[0] (modulo bf16 store).
         if (G == 1) {
@@ -408,9 +410,11 @@ TEST(CombineRealPartial, GInvariance) {
         // TIGHTER fp32 check vs cpu_ref_combine of the SAME scratch arrays (NOT vs
         // full_o). RATIONALE: the per-range bf16-P drift lives in BOTH the GPU
         // combine input AND this cpu_ref_combine input (the SAME scratch_o/lse) →
-        // it CANCELS; the residual is only device-vs-host combine arithmetic →
-        // ~1e-5. (Comparing the fp32 tap vs full_o would instead EXPOSE that ~2e-3
-        // input drift — wrong comparison; full_o is the un-split reference, not the
+        // it CANCELS; the residual is only device-vs-host combine arithmetic.
+        // MEASURED worst case across all G (gfx942, deterministic): 1.16e-9. Bound
+        // = 1e-8 (~8x the observed worst; same bound as the synthetic case).
+        // (Comparing the fp32 tap vs full_o would instead EXPOSE that ~2e-3 input
+        // drift — wrong comparison; full_o is the un-split reference, not the
         // combine of these partials.) Mirrors the synthetic gather, for B=1,Hq=2.
         std::vector<float> exp_combine((size_t)Hq * Sq * kD, 0.0f);
         std::vector<float> o_part((size_t)G * kD), lse_part(G);
@@ -427,7 +431,7 @@ TEST(CombineRealPartial, GInvariance) {
             }
         }
         std::string flabel = "real-fp32/G=" + std::to_string(G);
-        compare_max_abs(gpu_of32, exp_combine, flabel.c_str(), 1e-5f);
+        compare_max_abs(gpu_of32, exp_combine, flabel.c_str(), 1e-8f);
     }
 }
 

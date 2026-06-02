@@ -1,11 +1,13 @@
 .claude/
-build/
-build2/
-build_qa/
-workloads/
+build*/
 .rocprofv3/
-native_d64_kernel.s
+*.s
 
-# docs/ is tracked, EXCEPT working scratch (specs/plans are deleted after execution)
+# docs/ is tracked, EXCEPT superpowers spec/plan working scratch.
+# These stay ignored by default (working artifacts). To commit an IMPORTANT
+# spec/plan, get user approval then force-add the specific file:
+#   git add -f docs/superpowers/specs/<file>.md
+# The ignore is the safety net: it keeps drafts out of `git add -A` so only
+# deliberately-chosen docs enter history. (Already committed via -f:
+# split-K spec + plan, 2026-06-02.)
 docs/superpowers/
-docs/isa-rewrite-spec.md

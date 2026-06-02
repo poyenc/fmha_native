@@ -414,6 +414,58 @@ void run_split_keep_scratch(bool mask, const FmhaFwdParams& base,
     *d_sclse_out = d_sclse;
 }
 
+// ---------------------------------------------------------------------------
+// Scale every logical Q element (head_dim==kD columns per row) in place by
+// `f`, round-tripping through bf16 truncation so the stored values are exactly
+// what the kernel will read.  fill_random draws Q/K/V in [-0.1, 0.1]; with
+// scale=1/sqrt(64)=0.125 the raw logits q·k are O(0.01), so the softmax is
+// ESSENTIALLY UNIFORM — under which the output ≈ mean(V) and BOTH the KV-order
+// invariant AND its violation collapse to ~1 ULP (the test cannot see the bug).
+// Amplifying Q makes the logits O(1), the softmax genuinely peaked, and the
+// order-invariance a real, falsifiable property.  We scale Q (not K) so K's row
+// permutation in #2b still maps cleanly.  rows = B*Hq*Sq for this dense layout.
+// ---------------------------------------------------------------------------
+void amplify_q(std::vector<uint16_t>& h_Q, int rows, float f) {
+    for (int r = 0; r < rows; ++r)
+        for (int d = 0; d < kD; ++d) {
+            const size_t i = (size_t)r * kD + d;   // Dpad==kD here, no padding
+            h_Q[i] = float_to_bf16(bf16_to_float(h_Q[i]) * f);
+        }
+}
+
+// ---------------------------------------------------------------------------
+// Run the full split→combine pipeline and return the final O widened to fp32
+// (host vector, length B*Hq*Sq*kD).  Encapsulates the launch body shared by the
+// oracle-free invariant tests below (it is exactly the pipeline half of CASE 7's
+// MatchesSinglePass: run_split_keep_scratch → malloc d_o bf16 → memset →
+// run_combine_e2e → free scratch → memcpy back → bf16_to_float widen).  Frees
+// all device scratch/buffers it owns before returning.
+//
+// NOTE on EXPECT vs ASSERT: run_split_keep_scratch / run_combine_e2e use ASSERT_*
+// internally (those fire in the test thread, which is fine), but THIS helper is
+// non-void, so it must not use ASSERT_* itself (ASSERT in a value-returning
+// function does not compile).  We therefore use EXPECT_* for the local HIP calls.
+// ---------------------------------------------------------------------------
+std::vector<float> run_pipe_o(bool mask, const FmhaFwdParams& base,
+                             const SplitDims& dim) {
+    const int B = dim.B, Hq = dim.Hq, Sq = dim.Sq;
+    float *d_sco = nullptr, *d_sclse = nullptr;
+    run_split_keep_scratch(mask, base, dim, &d_sco, &d_sclse);
+    const size_t n_o = (size_t)B * Hq * Sq * kD;
+    __hip_bfloat16* d_o = nullptr;
+    EXPECT_EQ(hipMalloc(&d_o, n_o * sizeof(__hip_bfloat16)), hipSuccess);
+    EXPECT_EQ(hipMemset(d_o, 0, n_o * sizeof(__hip_bfloat16)), hipSuccess);
+    run_combine_e2e(dim, base.scale, d_sco, d_sclse, d_o);
+    hipFree(d_sco); hipFree(d_sclse);
+    std::vector<uint16_t> h(n_o);
+    EXPECT_EQ(hipMemcpy(h.data(), d_o, n_o * sizeof(uint16_t),
+                        hipMemcpyDeviceToHost), hipSuccess);
+    hipFree(d_o);
+    std::vector<float> o(n_o);
+    for (size_t i = 0; i < n_o; ++i) o[i] = bf16_to_float(h[i]);
+    return o;
+}
+
 } // namespace
 
 // ===========================================================================
@@ -1075,6 +1127,175 @@ TEST(SplitCombineE2E, MatchesSinglePass) {
         EXPECT_GE(cos,    kCosTol)   << "cosine below gate (structural/wiring bug?)";
         EXPECT_LE(rel_l2, kRelL2Tol) << "relative L2 above gate (magnitude/wiring bug?)";
     }
+}
+
+// ===========================================================================
+// ORACLE-FREE INVARIANT #2a — G-to-G direct equality (mask0).
+//
+// WHY THIS IS DIFFERENT FROM EVERYTHING ABOVE: every prior test compares the
+// pipeline against SOME reference we wrote (cpu_ref_split, gpu_ref_split,
+// gpu_ref_fmha_fwd, or the single-pass kernel).  If a math error were SHARED by
+// the pipeline AND its oracle, all those tests could pass while the result is
+// wrong.  This test takes no oracle at all: it runs the SAME producer + SAME
+// combine at DIFFERENT split counts G and asserts the final O agrees ACROSS G.
+// G=4 and G=8 are each other's reference; nothing external is trusted.
+//
+// WHY G-INVARIANCE MUST HOLD (the property being witnessed): split-K partitions
+// the KV range into G disjoint sub-ranges, computes a per-range normalized
+// partial (O_g, LSE_g), and the combine folds them back with the standard
+// flash-decoding convex reweight w_g = exp(LSE_g - LSE*) / Σ exp(LSE_h - LSE*).
+// That reconstruction recovers the SAME global softmax-weighted average of V
+// regardless of where the partition boundaries fall — it is mathematically
+// independent of G.  So O(G=2), O(G=4), O(G=8) are the SAME number in exact
+// arithmetic; only finite-precision rounding separates them.
+//
+// WHY NOT BIT-EXACT (tolerance source): the partials are fp32 and the final O is
+// bf16-TRUNCATED.  Different G partition the keys into different kN0(=64) tile
+// groupings, so the fp32 online-softmax accumulation ORDER differs per G, and
+// the reweight rounds at a slightly different place.  At this O magnitude (~0.02)
+// one bf16 ULP is ~8e-5, so a 1–2 ULP spread across G is expected and benign.
+// ===========================================================================
+TEST(SplitInvariant, GtoGDirectEquality_Mask0) {
+    FmhaParams p{};
+    p.batch = 1; p.q_heads = 2; p.kv_heads = 2; p.gqa = 1;
+    p.seq_len = 1920; p.kv_seq_len = 1920; p.head_dim = kD; p.mask = 0;
+
+    const int B = p.batch, Hq = p.q_heads, Sq = p.seq_len;
+
+    FmhaBuffers bufs(p);
+    bufs.fill_random(20260602);
+    // Amplify Q so the softmax is genuinely peaked (see amplify_q): without this
+    // the near-uniform softmax makes O≈mean(V) and the invariant is trivially
+    // satisfied — a vacuous test.  G-invariance must hold for ANY input, so a
+    // non-uniform input is the stronger witness.
+    amplify_q(bufs.h_Q, B * Hq * Sq, 16.0f);
+    bufs.copy_to_device();
+    FmhaFwdParams base = make_base_params(p, bufs);
+
+    // Same producer + same combine, only G differs.  o2 is the shared baseline;
+    // o4 and o8 must each reproduce it (they are each other's oracle).
+    std::vector<float> o2 = run_pipe_o(false, base, {2, B, Hq, Sq});
+    std::vector<float> o4 = run_pipe_o(false, base, {4, B, Hq, Sq});
+    std::vector<float> o8 = run_pipe_o(false, base, {8, B, Hq, Sq});
+
+    auto max_abs = [](const std::vector<float>& a, const std::vector<float>& b) {
+        float m = 0.0f;
+        for (size_t i = 0; i < a.size(); ++i)
+            m = std::max(m, std::fabs(a[i] - b[i]));
+        return m;
+    };
+    const float d42 = max_abs(o4, o2);
+    const float d82 = max_abs(o8, o2);
+    fprintf(stderr, "[SplitInvariant.GtoG_Mask0] max_abs(o4-o2)=%.6g max_abs(o8-o2)=%.6g\n",
+            d42, d82);
+
+    // TOLERANCE (measured, then 2x headroom — mirrors CASE 2's discipline).
+    // Observed on gfx942: max_abs(o4-o2)=3.05176e-05, max_abs(o8-o2)=3.05176e-05
+    // — exactly ONE bf16 ULP at O-magnitude ~0.02 (2^-8 · 2^-3 ≈ 3.1e-5).  Final
+    // bound = 6.5e-5 (~2x the observed value).  A real combine/producer math bug
+    // (e.g. a mis-scaled reweight) would break G-invariance and overshoot this by
+    // orders of magnitude.
+    EXPECT_LT(d42, 6.5e-5f) << "G=4 vs G=2 O disagreement (G-invariance broken)";
+    EXPECT_LT(d82, 6.5e-5f) << "G=8 vs G=2 O disagreement (G-invariance broken)";
+}
+
+// ===========================================================================
+// ORACLE-FREE INVARIANT #2b — KV-permutation invariance (mask0 ONLY).
+//
+// THE PROPERTY: softmax over keys is order-invariant.  The attention output for
+// a query row is Σ_s softmax(q·k_s) · v_s — a sum over keys — so permuting the
+// KV row order (K AND V together, with the SAME permutation, Q untouched) does
+// not change the per-row result.  Like #2a this is ORACLE-FREE: oA (natural KV
+// order) and oB (permuted KV order) are each other's reference; nothing external
+// is trusted.
+//
+// MASK0 ONLY (why mask1 is excluded): causal masking is POSITIONAL — key s is
+// visible to query row r iff s ≤ r + (Skv-Sq).  Permuting the key order changes
+// which absolute positions hold which (k,v) pair, so it changes the causal
+// structure itself and the result legitimately changes.  Order-invariance is a
+// property of the UNMASKED softmax, so we restrict this test to mask0.
+//
+// MUST PERMUTE K AND V WITH THE SAME PERM: the softmax weight for key s attaches
+// to value row s.  If K and V are permuted differently (or only one is permuted),
+// each weight multiplies the WRONG v — the result changes.  (The can-fail proof
+// for this test permutes K but not V and confirms a hard failure.)
+//
+// WHY NOT BIT-EXACT (tolerance source): reordering the keys changes (a) the
+// per-tile online-softmax accumulation ORDER and (b) which ABSOLUTE keys land in
+// which split — keys cross kN0(=64) tile and split boundaries differently — so
+// the fp32 partials and their bf16-rounded reweight differ slightly.  The math
+// is identical; the rounding is not.
+// ===========================================================================
+TEST(SplitInvariant, KvPermutationInvariance_Mask0) {
+    FmhaParams p{};
+    p.batch = 1; p.q_heads = 2; p.kv_heads = 2; p.gqa = 1;
+    p.seq_len = 1920; p.kv_seq_len = 1920; p.head_dim = kD; p.mask = 0;
+
+    const int B = p.batch, Hq = p.q_heads, Sq = p.seq_len, Skv = p.kv_seq_len;
+    const int Hkv = p.kv_heads;
+    const int Dpad = 64;        // head_dim==64 → no padding columns; loop d to 64
+    const int G = 4;
+
+    // --- Buffer A: natural KV order.  Amplify Q so the softmax is genuinely
+    // peaked (see amplify_q) — under the default near-uniform softmax O≈mean(V)
+    // and KV-order invariance is trivially (vacuously) true.  Q is amplified
+    // IDENTICALLY in A and B (same seed → same Q → same scaled Q).
+    FmhaBuffers bufsA(p);
+    bufsA.fill_random(7777);
+    amplify_q(bufsA.h_Q, B * Hq * Sq, 16.0f);
+    bufsA.copy_to_device();
+    FmhaFwdParams baseA = make_base_params(p, bufsA);
+    std::vector<float> oA = run_pipe_o(false, baseA, {G, B, Hq, Sq});
+
+    // --- Deterministic permutation of the Skv key rows.  Fixed-LCG Fisher-Yates
+    // (NO <random> nondeterminism) so the test is fully reproducible run-to-run.
+    std::vector<int> perm(Skv);
+    for (int i = 0; i < Skv; ++i) perm[i] = i;
+    unsigned s = 0xC0FFEEu;
+    auto nxt = [&] { s = s * 1664525u + 1013904223u; return s; };
+    for (int i = Skv - 1; i > 0; --i) {
+        int j = (int)(nxt() % (unsigned)(i + 1));
+        std::swap(perm[i], perm[j]);
+    }
+
+    // --- Buffer B: SAME seed → Q,K,V identical to A pre-permute.  Then reorder
+    // the K and V rows in place by `perm` (Q untouched).  In-place reorder must
+    // read from a SNAPSHOT (else we'd overwrite source rows we still need):
+    // dst row s ← source row perm[s].
+    FmhaBuffers bufsB(p);
+    bufsB.fill_random(7777);
+    amplify_q(bufsB.h_Q, B * Hq * Sq, 16.0f);  // identical Q to buffer A
+    auto K0 = bufsB.h_K;        // pre-permute copies (the read source)
+    auto V0 = bufsB.h_V;
+    for (int b = 0; b < B; ++b)
+    for (int h = 0; h < Hkv; ++h) {
+        const size_t row_base = ((size_t)(b * Hkv + h) * Skv) * Dpad;
+        for (int row = 0; row < Skv; ++row) {
+            const size_t dst = row_base + (size_t)row      * Dpad;
+            const size_t src = row_base + (size_t)perm[row] * Dpad;
+            for (int d = 0; d < 64; ++d) {
+                bufsB.h_K[dst + d] = K0[src + d];
+                bufsB.h_V[dst + d] = V0[src + d];
+            }
+        }
+    }
+    bufsB.copy_to_device();
+    FmhaFwdParams baseB = make_base_params(p, bufsB);
+    std::vector<float> oB = run_pipe_o(false, baseB, {G, B, Hq, Sq});
+
+    float m = 0.0f;
+    for (size_t i = 0; i < oA.size(); ++i)
+        m = std::max(m, std::fabs(oA[i] - oB[i]));
+    fprintf(stderr, "[SplitInvariant.KvPerm_Mask0] max_abs(oA-oB)=%.6g\n", m);
+
+    // TOLERANCE (measured, then 2x headroom).  Observed on gfx942:
+    // max_abs(oA-oB)=3.05176e-05 — one bf16 ULP at O-magnitude ~0.02.  The
+    // permutation changes BOTH the online-softmax accumulation order AND the
+    // absolute-key→split assignment (keys cross kN0=64 tile/split boundaries), but
+    // at this seed the net movement is still a single ULP.  Final bound = 6.5e-5
+    // (~2x observed).  Permuting K without V (the can-fail) attaches weights to
+    // the wrong V rows and blows far past this.
+    EXPECT_LT(m, 6.5e-5f) << "O changed under KV permutation (order-invariance broken)";
 }
 
 int main(int argc, char** argv) {
